@@ -8,8 +8,9 @@ description: >-
   UNEXPECTED_STATE / BEFORE_DESTRUCTIVE_ACTION / REVIEW_REQUIRED /
   FINAL_VERIFICATION) with evidence attachments through the Neutral Relay,
   and clean up temporary state on end. Agent-agnostic: agent-specific
-  installation and invocation live in per-agent adapters
-  (skills/adapters/<agent>/), never here.
+  installation and invocation may be provided by agent-specific adapters;
+  existing integrations remain in their current locations during the Phase 1A
+  transition.
 ---
 
 # GovernLoop — Universal Protocol Skill
@@ -18,8 +19,10 @@ GovernLoop connects a local coding agent (execution side) to a ChatGPT
 conversation (reasoning/review side). This file is the **protocol-only**
 entrypoint: it defines the session model, checkpoint protocol, relay
 interaction, authorization boundary, and fail-closed rules that every agent
-follows. It contains **no agent-specific installation or command binding**
-(those live in `skills/adapters/<agent>/`).
+follows. It contains **no agent-specific installation or command binding**.
+Agent-specific installation and invocation may be provided by agent-specific
+adapters; existing integrations remain in their current locations during the
+Phase 1A transition.
 
 Two layers, one shared model:
 
@@ -65,8 +68,12 @@ Environment (all injectable):
 |---|---|---|
 | `GOVERLOOP_STATE_DIR` | temp session state dir | `/tmp` |
 | `GOVERLOOP_CDP_PORT` | CDP port | `9233` |
-| `GOVERLOOP_RELAY_PATH` | path to `neutral_relay.py` | repo canonical |
+| `GOVERLOOP_RELAY_PATH` | path to `neutral_relay.py` | installation-specific absolute path in the current runtime; override when it does not match the local GovernLoop checkout |
 | `LINEAR_ISSUE_ID` / `GITHUB_ISSUE_ID` / `ISSUE_ID` / `TASK_ID` / `GOVERLOOP_TASK` | task identity (highest priority) | — |
+
+For portable/cold-start use: the current runtime has an installation-specific
+default for the relay path. Discover the local GovernLoop checkout and set
+`GOVERLOOP_RELAY_PATH` explicitly when the default does not match.
 
 ## 3. Session lifecycle
 
@@ -201,9 +208,14 @@ In particular:
 ## 8. Adapter boundary (what is NOT here)
 
 - **Per-agent installation paths** (e.g. `~/.workbuddy/skills/`,
-  `~/.config/opencode/skills/`) → adapters.
-- **Command binding / UX** (e.g. `/governloop` slash command) → adapters.
-- **Agent-specific invocation conventions** → adapters.
+  `~/.config/opencode/skills/`) → agent-specific integration/adapters when
+  present.
+- **Command binding / UX** (e.g. `/governloop` slash command) →
+  agent-specific integration/adapters when present.
+- **Agent-specific invocation conventions** → agent-specific
+  integration/adapters when present.
 
 This file must stay agent-agnostic: if a rule applies only to one agent, it
-belongs in that agent's adapter, not here.
+belongs in that agent's integration/adapters when present, not here. During
+the Phase 1A transition no adapters directory exists yet — existing
+integrations stay in their current locations.
