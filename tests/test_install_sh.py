@@ -633,6 +633,44 @@ class Phase2BRuntimeBundleTests(InstallerSkeletonTests):
         self.assertTrue((home / "versions" / new_id).is_dir())
         self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
 
+    def test_first_install_rollback_removes_created_dispatcher(self):
+        """P1 fix: a failed FIRST install must not leave the stable dispatcher
+        behind. Initial state has no current / version / metadata / dispatcher;
+        dispatcher publication succeeds, then GOVERLOOP_FAIL_BEFORE_ACTIVATE
+        fails the run before current activation -> rollback must remove the
+        dispatcher this run created."""
+        repo = self.make_source_repo()
+        home = self.root / "fresh-home"
+        install_id = self.installed_id(repo, home)
+        # Initial state: nothing exists.
+        self.assertFalse(home.exists())
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_FAIL_BEFORE_ACTIVATE"] = "1"
+        failed = subprocess.run(
+            ["sh", str(repo / "scripts" / "install.sh")],
+            text=True, capture_output=True, env=env,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("injected interrupt before activation replace", failed.stderr)
+        # No partial failed install: current, version, metadata, dispatcher all
+        # absent, and no stage artifacts remain.
+        self.assertFalse((home / "current").exists())
+        self.assertFalse((home / "versions" / install_id).exists())
+        self.assertFalse((home / "metadata" / f"{install_id}.json").exists())
+        self.assertFalse((home / "bin/governloop").exists())
+        self.assertEqual(list((home / "versions").glob(".*.stage.*")), [])
+        self.assertEqual(list(home.glob(".bin.governloop.stage.*")), [])
+        self.assertEqual(list(home.glob(".current.stage.*")), [])
+
+        # Retry without the injection succeeds (INSTALL_ID still retryable).
+        retry = self.installer(repo, home, check=False)
+        self.assertEqual(retry.returncode, 0)
+        self.assertTrue((home / "versions" / install_id).is_dir())
+        self.assertTrue((home / "bin/governloop").is_file())
+        self.assertEqual(os.readlink(home / "current"), f"versions/{install_id}")
+
 
 if __name__ == "__main__":
     unittest.main()

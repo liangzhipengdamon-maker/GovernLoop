@@ -353,6 +353,11 @@ install_skeleton() {
   current_path="$GOVERLOOP_HOME/current"
   dispatcher_path="$bin_dir/governloop"
   dispatcher_stage="$GOVERLOOP_HOME/.bin.governloop.stage.$$"
+  # Whether the stable entrypoint existed before this run. A first install that
+  # creates it and then fails BEFORE current activation must remove it during
+  # rollback; an upgrade that reuses an installer-managed (byte-identical)
+  # dispatcher must leave it intact.
+  dispatcher_pre_existed=0
 
   # --- current pointer preflight (fail-closed) -------------------------------
   # Only two states are safe to replace atomically:
@@ -397,6 +402,7 @@ install_skeleton() {
   # version's wrapper). Never silently overwrite user-owned state: accept only
   # absence or byte-identical installer content.
   if [ -e "$dispatcher_path" ] || [ -L "$dispatcher_path" ]; then
+    dispatcher_pre_existed=1
     if [ -L "$dispatcher_path" ] || [ -d "$dispatcher_path" ]; then
       fail "bin/governloop exists as a non-regular file; refusing to overwrite"
     fi
@@ -443,6 +449,13 @@ install_skeleton() {
     fi
     [ "$version_published" -eq 1 ] && rm -rf "$version_dir"
     [ "$metadata_published" -eq 1 ] && rm -f "$metadata_index"
+    # A failed pre-activation install must not leave a stable entrypoint that
+    # THIS run created (there is no current to resolve through it). A
+    # dispatcher that already existed before this run (accepted as
+    # installer-managed byte-identical content) is always left intact.
+    if [ "$dispatcher_pre_existed" -eq 0 ]; then
+      rm -f "$dispatcher_path"
+    fi
   }
   trap cleanup EXIT HUP INT TERM
 
