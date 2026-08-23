@@ -213,6 +213,69 @@ class InstallerSkeletonTests(unittest.TestCase):
         self.assertTrue((home / "current").is_symlink())
         self.assertEqual(os.readlink(home / "current"), old_target)
 
+    def test_activation_interrupt_preserves_committed_install(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        old_target = os.readlink(home / "current")
+
+        # New immutable identity -> new INSTALL_ID.
+        (repo / "payload.txt").write_text("two\n", encoding="utf-8")
+        self.git(repo, "add", "payload.txt")
+        self.git(repo, "commit", "-m", "second")
+        new_id = f"main.{self.source_short_sha(repo)}"
+
+        # Simulate a termination between the atomic rename of current and the
+        # in-memory activated flag being set. cleanup must detect that current
+        # already resolves exactly to this run's version and treat activation as
+        # committed (do NOT roll back the published artifacts).
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_FAIL_AFTER_ACTIVATE"] = "1"
+        failed = subprocess.run(
+            ["sh", str(repo / "scripts" / "install.sh")],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("injected interrupt after activation rename", failed.stderr)
+        # Committed: current moved to the new install (not the stale target) and
+        # the published version directory is kept rather than rolled back.
+        self.assertTrue((home / "current").is_symlink())
+        self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
+        self.assertNotEqual(os.readlink(home / "current"), old_target)
+        self.assertTrue((home / "versions" / new_id).is_dir())
+
+    def test_current_symlink_traversal_rejected(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        home.mkdir(parents=True)
+        # A symlink whose target uses traversal / nested path: not the exact
+        # canonical "versions/<INSTALL_ID>" shape.
+        os.symlink("versions/../escape", home / "current")
+
+        result = self.installer(repo, home, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed or uses traversal", result.stderr)
+        # Fail-closed: pre-existing symlink is preserved, nothing published.
+        self.assertTrue((home / "current").is_symlink())
+        self.assertFalse((home / "versions").exists())
+
+    def test_current_symlink_missing_target_rejected(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        home.mkdir(parents=True)
+        # A well-shaped but dangling installer-style symlink (target absent).
+        os.symlink("versions/does-not-exist", home / "current")
+
+        result = self.installer(repo, home, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing version directory", result.stderr)
+        # Fail-closed: pre-existing symlink is preserved, nothing published.
+        self.assertTrue((home / "current").is_symlink())
+        self.assertFalse((home / "versions").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

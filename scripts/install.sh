@@ -125,20 +125,38 @@ install_skeleton() {
   # --- current pointer preflight (fail-closed) -------------------------------
   # Only two states are safe to replace atomically:
   #   * current is absent, or
-  #   * current is an installer-managed symlink (target under versions/).
-  # Any other object (regular file, directory, or an unexpected symlink) is
-  # rejected so we never silently overwrite pre-existing state with mv -f.
+  #   * current is an installer-managed symlink with the exact canonical shape
+  #     "versions/<INSTALL_ID>" (single component, no traversal) pointing at an
+  #     existing installed version.
+  # Any other object (regular file, directory, symlink with a malformed or
+  # dangling target) is rejected so we never silently overwrite or trust
+  # pre-existing state with mv -f.
   if [ -e "$current_path" ] || [ -L "$current_path" ]; then
-    if [ -L "$current_path" ]; then
-      current_target=$(readlink "$current_path")
-      case "$current_target" in
-        versions/*) : ;;  # installer-managed symlink: safe to replace atomically
-        *) fail "current is a symlink to an unexpected target; refusing: $current_target" ;;
-      esac
-    elif [ -d "$current_path" ]; then
-      fail "current exists as a directory; refusing non-atomic replacement"
-    else
+    if [ ! -L "$current_path" ]; then
+      # Regular file or directory: never overwrite with mv -f.
+      if [ -d "$current_path" ]; then
+        fail "current exists as a directory; refusing non-atomic replacement"
+      fi
       fail "current exists as a regular file; refusing non-atomic replacement"
+    fi
+    # current is a symlink: require the exact installer-managed shape.
+    current_target=$(readlink "$current_path")
+    case "$current_target" in
+      versions/*)
+        # Reject traversal, nested paths, or an empty component. The architecture
+        # contract is current -> exactly one installed immutable INSTALL_ID.
+        rest=${current_target#versions/}
+        case "$rest" in
+          ""|.|..|*/*)
+            fail "current symlink target is malformed or uses traversal: $current_target" ;;
+        esac
+        ;;
+      *)
+        fail "current symlink target is not installer-managed: $current_target" ;;
+    esac
+    # Reject dangling symlinks: the targeted version directory must exist.
+    if [ ! -e "$current_path" ]; then
+      fail "current symlink points to a missing version directory: $current_target"
     fi
   fi
 
@@ -156,13 +174,30 @@ install_skeleton() {
   version_published=0
   metadata_published=0
   activated=0
+  # Decide committed activation from actual filesystem state. This is robust
+  # against a signal/termination arriving between the atomic rename of current
+  # and the in-memory activated flag being set: even if activated is still 0, a
+  # current that already resolves exactly to this run's version (with that
+  # directory present) is committed and must NOT be rolled back.
+  activation_committed() {
+    [ -L "$current_path" ] || return 1
+    cur=$(readlink "$current_path")
+    [ "$cur" = "versions/$INSTALL_ID" ] || return 1
+    [ -d "$version_dir" ] || return 1
+    return 0
+  }
   cleanup() {
     rm -rf "$stage_dir"
     rm -f "$metadata_stage" "$current_stage"
-    if [ "$activated" -ne 1 ]; then
-      [ "$version_published" -eq 1 ] && rm -rf "$version_dir"
-      [ "$metadata_published" -eq 1 ] && rm -f "$metadata_index"
+    # Committed (normal success, or an interrupt after the rename): keep the
+    # published artifacts. Only roll back THIS run's published artifacts when
+    # activation is NOT committed, so a failed install leaves no partial and a
+    # pre-existing completed install is never touched.
+    if [ "$activated" -eq 1 ] || activation_committed; then
+      return
     fi
+    [ "$version_published" -eq 1 ] && rm -rf "$version_dir"
+    [ "$metadata_published" -eq 1 ] && rm -f "$metadata_index"
   }
   trap cleanup EXIT HUP INT TERM
 
@@ -175,8 +210,8 @@ install_skeleton() {
   write_metadata "$metadata_stage" "$installed_at"
 
   # Publish the immutable version first. It is still recoverable: if any later
-  # step fails, cleanup removes it, so a failed install leaves no partial
-  # versions/<INSTALL_ID> and the INSTALL_ID stays retryable.
+  # step fails before activation, cleanup removes it, so a failed install leaves
+  # no partial versions/<INSTALL_ID> and the INSTALL_ID stays retryable.
   mv "$stage_dir" "$version_dir"
   version_published=1
 
@@ -186,8 +221,22 @@ install_skeleton() {
   # Build the replacement symlink separately, then rename it into place. Rename
   # within one filesystem is atomic; current therefore never points at a partial
   # version directory.
+  #
+  # NOTE: current may already be a symlink whose target is a VERSION DIRECTORY.
+  # A bare `mv -f` would follow that symlink and move the new link *into* the
+  # directory instead of replacing the pointer. So remove the existing pointer
+  # symlink first (rm never follows it into its target), then rename the temp
+  # link into place.
   ln -s "versions/$INSTALL_ID" "$current_stage"
-  mv -f "$current_stage" "$current_path"
+  rm -f "$current_path"
+  mv "$current_stage" "$current_path"
+
+  # Injection point for deterministic interrupt-after-activate tests: simulate a
+  # termination between the atomic rename and the activated flag being set.
+  if [ "${GOVERLOOP_FAIL_AFTER_ACTIVATE:-0}" = "1" ]; then
+    fail "injected interrupt after activation rename"
+  fi
+
   activated=1
 
   trap - EXIT HUP INT TERM
