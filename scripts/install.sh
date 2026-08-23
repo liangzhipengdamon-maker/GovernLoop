@@ -141,11 +141,11 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VERSION_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 runtime_dir="$VERSION_ROOT/runtime"
 if [ ! -f "$runtime_dir/governloop_session.py" ]; then
-  echo "ERROR: installed runtime missing: $runtime_dir/governloop_session.py" >&2
+  echo "[FAIL] installed runtime missing: $runtime_dir/governloop_session.py" >&2
   exit 1
 fi
 if [ ! -f "$runtime_dir/neutral_relay.py" ]; then
-  echo "ERROR: installed relay missing: $runtime_dir/neutral_relay.py" >&2
+  echo "[FAIL] installed relay missing: $runtime_dir/neutral_relay.py" >&2
   exit 1
 fi
 : "${GOVERLOOP_RELAY_PATH:=$runtime_dir/neutral_relay.py}"

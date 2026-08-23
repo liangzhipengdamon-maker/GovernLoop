@@ -557,6 +557,8 @@ def main(argv=None):
     p_end.add_argument("--attach", action="append", default=[])
     p_end.add_argument("--session", dest="sid", default=None)
 
+    sub.add_parser("doctor", help="read-only diagnostics (Phase 2C: stable CLI + doctor)")
+
     args = p.parse_args(argv)
     cwd = os.getcwd()
 
@@ -618,7 +620,243 @@ def main(argv=None):
         print(text)
         return code if not ok else 0
 
+    if args.cmd == "doctor":
+        results = doctor_report()
+        has_fail = False
+        has_warn = False
+        for level, label, detail in results:
+            if level == "FAIL":
+                has_fail = True
+            elif level == "WARN":
+                has_warn = True
+            print(f"[{level}] {label}: {detail}")
+        print()
+        if has_fail:
+            print("RESULT: FAIL — one or more checks failed; GovernLoop may not function correctly")
+            return 1
+        elif has_warn:
+            print("RESULT: WARN — one or more checks have warnings; GovernLoop should work but check above")
+            return 0
+        else:
+            print("RESULT: PASS — all checks passed")
+            return 0
+
     return 0
+
+
+# --------------------------------------------------------------------------
+# doctor (read-only diagnostics — Phase 2C)
+# --------------------------------------------------------------------------
+# All paths resolved relative to the runtime that is currently active (i.e.
+# the directory containing THIS file after installation).  The caller\'s cwd
+# is NEVER changed and no filesystem mutation occurs.
+
+def _rel_path(path, base):
+    """Return path relative to base, or the original if outside base."""
+    try:
+        return os.path.relpath(os.path.realpath(path), os.path.realpath(base))
+    except ValueError:
+        return path
+
+
+def _check_blocking(state_dir=None):
+    """Return (level, message) for the most severe blocking condition."""
+    home = os.environ.get("GOVERLOOP_HOME", os.path.join(os.path.expanduser("~"), ".governloop"))
+    current = os.path.join(home, "current")
+    if not os.path.exists(current):
+        return "FAIL", f"No active version: {current} does not exist (run the installer first)"
+    if os.path.islink(current):
+        target = os.readlink(current)
+        if not target.startswith("versions/"):
+            return "FAIL", f"current symlink is not installer-managed: {target}"
+        if not os.path.exists(current):
+            return "FAIL", f"current symlink is dangling: {target}"
+    else:
+        return "FAIL", f"current exists but is not a symlink (type: {os.path.lstat(current).st_mode & 0o170000:#o:o})",
+    return None, None
+
+
+def doctor_report(goverloop_home=None, state_dir=None):
+    """Run read-only diagnostics. Returns list of (result, label, detail) tuples.
+
+    Result is one of: PASS, WARN, FAIL
+    This function is idempotent and performs NO filesystem mutation.
+    """
+    home = goverloop_home or os.environ.get("GOVERLOOP_HOME",
+                                            os.path.join(os.path.expanduser("~"), ".governloop"))
+    state_dir = state_dir or os.environ.get("GOVERLOOP_STATE_DIR", STATE_DIR_DEFAULT)
+    # Resolve this runtime\'s own directory for comparison (checkout-independent).
+    runtime_dir = os.path.dirname(os.path.abspath(__file__))
+    results = []
+
+    # 1. GovernLoop home path
+    if os.path.isdir(home):
+        results.append(("PASS", "GovernLoop home", f"{home} (exists)"))
+    else:
+        results.append(("FAIL", "GovernLoop home", f"{home} (not found — run install.sh)"))
+        return results  # nothing else can be checked
+
+    # 2. Stable CLI present (the dispatcher at GOVERLOOP_HOME/bin/governloop)
+    dispatcher = os.path.join(home, "bin", "governloop")
+    if os.path.isfile(dispatcher) and os.access(dispatcher, os.X_OK):
+        results.append(("PASS", "Stable CLI", f"{dispatcher} (executable)"))
+    elif os.path.isfile(dispatcher):
+        results.append(("WARN", "Stable CLI", f"{dispatcher} (exists but not executable)"))
+    else:
+        results.append(("FAIL", "Stable CLI", f"{dispatcher} (not found)"))
+
+    # 3. current pointer present and valid
+    current = os.path.join(home, "current")
+    if os.path.islink(current):
+        target = os.readlink(current)
+        if not target.startswith("versions/"):
+            results.append(("FAIL", "current pointer", f"malformed target (not versions/*): {target}"))
+        elif not os.path.exists(current):
+            results.append(("FAIL", "current pointer", f"dangling symlink: {target}"))
+        else:
+            results.append(("PASS", "current pointer", f"{target} (valid)"))
+    elif os.path.exists(current):
+        results.append(("FAIL", "current pointer", f"exists but is not a symlink"))
+    else:
+        results.append(("FAIL", "current pointer", f"{current} (absent)"))
+
+    # 4. Active INSTALL_ID / version directory
+    if os.path.islink(current) and os.path.exists(current):
+        version_dir = os.path.join(home, os.readlink(current))
+        install_id = os.path.basename(version_dir)
+        if os.path.isdir(version_dir):
+            results.append(("PASS", "Active version", f"{install_id} at {version_dir}"))
+            # Verify it\'s the same directory this runtime resolves to.
+            runtime_marker = os.path.join(runtime_dir, "governloop_session.py")
+            if os.path.realpath(runtime_marker) == os.path.realpath(os.path.join(version_dir, "runtime", "governloop_session.py")):
+                results.append(("PASS", "Runtime matches current", "active version is the running runtime"))
+            else:
+                results.append(("WARN", "Runtime matches current",
+                                f"running runtime is {runtime_dir} but current -> {version_dir}"))
+        else:
+            results.append(("FAIL", "Active version", f"current target is not a directory: {version_dir}"))
+    else:
+        results.append(("FAIL", "Active version", "cannot check: current pointer unavailable"))
+
+    # 5. Installed runtime files present
+    for fname in ("governloop_session.py", "neutral_relay.py"):
+        fp = os.path.join(runtime_dir, fname)
+        if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+            results.append(("PASS", f"Runtime file: {fname}", f"{_rel_path(fp, runtime_dir)} ({os.path.getsize(fp)} bytes)"))
+        elif os.path.isfile(fp):
+            results.append(("FAIL", f"Runtime file: {fname}", f"{_rel_path(fp, runtime_dir)} (empty)"))
+        else:
+            results.append(("FAIL", f"Runtime file: {fname}", f"{_rel_path(fp, runtime_dir)} (missing)"))
+
+    # 6. Installed universal skill present
+    skill_path = os.path.join(runtime_dir, "..", "skills", "governloop", "SKILL.md")
+    if os.path.isfile(skill_path) and os.path.getsize(skill_path) > 0:
+        results.append(("PASS", "Installed skill", f"{_rel_path(skill_path, runtime_dir)}"))
+    else:
+        results.append(("WARN", "Installed skill", f"{_rel_path(skill_path, runtime_dir)} (missing or empty)"))
+
+    # 7. Normative contracts present
+    contracts_dir = os.path.join(runtime_dir, "..", "skills", "governloop", "contracts")
+    expected_contracts = [
+        "neutral-relay-checkpoint-delivery.md",
+        "AGENT_SAFETY_CONTRACT.md",
+        "policy.md",
+    ]
+    for cname in expected_contracts:
+        cp = os.path.join(contracts_dir, cname)
+        if os.path.isfile(cp):
+            results.append(("PASS", f"Contract: {cname}", "present"))
+        else:
+            results.append(("WARN", f"Contract: {cname}", "missing"))
+
+    # 8. Canonical relay config path
+    relay_config = os.path.join(home, "relay", "config.json")
+    if os.path.isfile(relay_config):
+        results.append(("PASS", "Relay config", f"{relay_config}"))
+    else:
+        results.append(("WARN", "Relay config", f"{relay_config} (optional; relay works without it)"))
+
+    # 9. Configured CDP port
+    cdp_port = int(os.environ.get("GOVERLOOP_CDP_PORT", "0"))
+    if cdp_port > 0:
+        results.append(("PASS", "CDP port (env)", f"GOVERLOOP_CDP_PORT={cdp_port}"))
+    elif os.path.isfile(relay_config):
+        try:
+            with open(relay_config, encoding="utf-8") as f:
+                cfg = json.load(f)
+            p = cfg.get("runtime", {}).get("cdp_port")
+            if p:
+                results.append(("PASS", "CDP port (config)", f"{relay_config} → cdp_port={p}"))
+            else:
+                results.append(("WARN", "CDP port (config)", "runtime.cdp_port not set in relay config"))
+        except Exception as e:
+            results.append(("WARN", "CDP port (config)", f"could not read {relay_config}: {e}"))
+    else:
+        results.append(("WARN", "CDP port", f"not configured (env or {relay_config}); using default {DEFAULT_CDP_PORT}"))
+
+    # 10. Neutral Relay path resolution
+    relay_resolved = RELAY_DEFAULT
+    if os.path.isfile(relay_resolved):
+        results.append(("PASS", "Neutral Relay", f"{_rel_path(relay_resolved, runtime_dir)} ({os.path.getsize(relay_resolved)} bytes)"))
+    else:
+        results.append(("FAIL", "Neutral Relay", f"not found at {relay_resolved}"))
+
+    # 11. Python 3 availability
+    py = sys.executable or "python3"
+    try:
+        r = subprocess.run([py, "--version"], capture_output=True, text=True, timeout=10)
+        py_ver = r.stdout.strip() or r.stderr.strip() or "unknown"
+        if py_ver.startswith("Python 3"):
+            results.append(("PASS", "Python 3", f"{py}: {py_ver}"))
+        else:
+            results.append(("WARN", "Python 3", f"{py}: {py_ver} (may not be Python 3)"))
+    except Exception as e:
+        results.append(("FAIL", "Python 3", f"{py} not available: {e}"))
+
+    # 12. Installed runtime checkout independence sanity
+    # This file must resolve inside a version/ directory, not a source checkout.
+    # If the running binary is inside a source checkout, this is a checkout-dependent
+    # invocation (fine for development, but the installed runtime is preferred).
+    in_checkout = "GovernLoop" in runtime_dir and "versions" not in runtime_dir
+    in_version_dir = "versions" in runtime_dir
+    if in_version_dir:
+        results.append(("PASS", "Runtime isolation", "running from installed version directory (checkout-independent)"))
+    elif in_checkout:
+        results.append(("WARN", "Runtime isolation",
+                        f"running from source checkout: {runtime_dir} (use installed runtime for production)"))
+    else:
+        results.append(("WARN", "Runtime isolation", f"runtime location unclear: {runtime_dir}"))
+
+    # 13. Whether current working directory looks like a target repository
+    cwd = os.getcwd()
+    git_toplevel = ""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            git_toplevel = r.stdout.strip()
+    except Exception:
+        pass
+    if git_toplevel:
+        results.append(("PASS", "Target repo detection", f"cwd={cwd} (git toplevel={git_toplevel})",
+                        ))
+        if cwd != git_toplevel:
+            results.append(("WARN", "Target repo cwd",
+                            f"cwd ({cwd}) != git toplevel ({git_toplevel}); session created for git toplevel"))
+    else:
+        results.append(("WARN", "Target repo detection",
+                        f"cwd={cwd} is not inside a git repository; sessions will use directory name as repo identifier"))
+
+    # 14. Any blocking issue
+    block_level, block_msg = _check_blocking(state_dir)
+    if block_level == "FAIL":
+        results.append(("FAIL", "Blocking issue", block_msg))
+    elif block_level == "WARN":
+        results.append(("WARN", "Blocking issue", block_msg))
+    else:
+        results.append(("PASS", "Blocking issue", "no blocking conditions detected"))
+
+    return results
 
 
 def _require_session(state_dir, cwd):

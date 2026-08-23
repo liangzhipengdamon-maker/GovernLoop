@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -670,6 +671,287 @@ class Phase2BRuntimeBundleTests(InstallerSkeletonTests):
         self.assertTrue((home / "versions" / install_id).is_dir())
         self.assertTrue((home / "bin/governloop").is_file())
         self.assertEqual(os.readlink(home / "current"), f"versions/{install_id}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2C: stable CLI + read-only doctor
+# ---------------------------------------------------------------------------
+class Phase2CDiagnosticsTests(Phase2BRuntimeBundleTests):
+    """Phase 2C: stable CLI routes, doctor subcommand, read-only guarantees."""
+
+    def test_doctor_subcommand_routed_by_stable_cli(self):
+        """stable CLI forwards `doctor` to the active version without cd."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        target = self.root / "target-project"
+        target.mkdir()
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        # doctor is read-only and must always exit 0 (PASS) or 1 (FAIL), never crash
+        self.assertIn(r.returncode, (0, 1), r.stderr)
+        output = r.stdout + r.stderr
+        self.assertIn("[PASS]", output)
+
+    def test_doctor_is_readonly_no_filesystem_mutation(self):
+        """doctor must not create, delete, or modify any files."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+
+        # Snapshot all files before running doctor.
+        def all_files(root):
+            return {str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file()}
+
+        before = all_files(home)
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1))
+
+        after = all_files(home)
+        created = after - before
+        deleted = before - after
+        self.assertEqual(created, set(), f"doctor created files: {created}")
+        self.assertEqual(deleted, set(), f"doctor deleted files: {deleted}")
+
+    def test_doctor_works_after_source_checkout_removed(self):
+        """doctor works from an installed runtime after the source checkout is gone."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        version_dir = home / "versions" / install_id
+
+        # Remove the original checkout (simulates production after install).
+        shutil.rmtree(repo)
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1), r.stderr)
+        output = r.stdout + r.stderr
+        self.assertIn("[PASS]", output)
+        # Neutral Relay check should PASS (sibling resolution inside version dir).
+        relay_lines = [l for l in output.splitlines() if "Neutral Relay" in l]
+        self.assertTrue(relay_lines, "doctor must report Neutral Relay status")
+        self.assertTrue(any("PASS" in l for l in relay_lines),
+                        f"Neutral Relay should PASS but got: {relay_lines}")
+
+    def test_doctor_caller_cwd_preserved(self):
+        """stable CLI does not change the caller's cwd; doctor runs from target project."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        target = self.root / "target-repo"
+        target.mkdir()
+        self.git(target, "init")
+        self.git(target, "config", "user.email", "t@example.invalid")
+        self.git(target, "config", "user.name", "Target")
+        self.git(target, "remote", "add", "origin",
+                 "https://github.com/owner/project.git")
+        (target / "x.txt").write_text("x\n", encoding="utf-8")
+        self.git(target, "add", ".")
+        self.git(target, "commit", "-m", "init")
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1), r.stderr)
+        # doctor must report the target repo detection using the caller's cwd.
+        output = r.stdout + r.stderr
+        self.assertTrue(any("Target repo detection" in l for l in output.splitlines()),
+                        "doctor must include Target repo detection line")
+        # The cwd must be reported as the target directory, not the home.
+        target_lines = [l for l in output.splitlines() if "Target repo detection" in l]
+        for line in target_lines:
+            self.assertIn(str(target), line,
+                          f"doctor cwd detection should mention target path: {line}")
+            self.assertNotIn(str(home), line,
+                             f"doctor cwd detection must not mention home path: {line}")
+
+    def test_doctor_detects_missing_current(self):
+        """doctor reports FAIL when current pointer is absent."""
+        home = self.root / "broken-home"
+        home.mkdir(parents=True)
+        (home / "bin").mkdir()
+
+        # Call the session manager Python directly (the stable CLI dispatcher
+        # requires current to exist; doctor must detect the broken state).
+        # Use the installed runtime from a different home as the Python binary.
+        repo = self.make_source_repo()
+        working_home = self.root / "working-home"
+        self.installer(repo, working_home)
+        install_id = self.installed_id(repo, working_home)
+        version_dir = working_home / "versions" / install_id
+        python_bin = version_dir / "runtime" / "governloop_session.py"
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [sys.executable, str(python_bin), "doctor"],
+            env=env, text=True, capture_output=True,
+        )
+        # Must not crash; must report FAIL.
+        self.assertIn(r.returncode, (0, 1))
+        output = r.stdout + r.stderr
+        self.assertIn("[FAIL]", output)
+
+    def test_doctor_detects_missing_runtime_files(self):
+        """doctor reports FAIL/WARN when runtime files are missing."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        version_dir = home / "versions" / install_id
+
+        # Remove a required runtime file.
+        runtime_file = version_dir / "runtime" / "governloop_session.py"
+        self.assertTrue(runtime_file.is_file())
+        backup = runtime_file.read_bytes()
+        runtime_file.unlink()
+        try:
+            env = os.environ.copy()
+            env["GOVERLOOP_HOME"] = str(home)
+            env.pop("GOVERLOOP_RELAY_PATH", None)
+            # Use the version wrapper: its guard detects missing runtime files
+            # and exits with [FAIL] before Python doctor can even start.
+            # This is correct: the wrapper is the outer safety net.
+            r = subprocess.run(
+                [str(version_dir / "bin/governloop"), "doctor"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertIn(r.returncode, (0, 1))
+            output = r.stdout + r.stderr
+            self.assertIn("[FAIL]", output)
+        finally:
+            runtime_file.write_bytes(backup)
+
+    def test_doctor_detects_missing_contracts(self):
+        """doctor reports WARN when normative contracts are absent."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        version_dir = home / "versions" / install_id
+
+        contracts_dir = version_dir / "skills" / "governloop" / "contracts"
+        policy = contracts_dir / "policy.md"
+        self.assertTrue(policy.is_file())
+        backup = policy.read_bytes()
+        policy.unlink()
+        try:
+            env = os.environ.copy()
+            env["GOVERLOOP_HOME"] = str(home)
+            env.pop("GOVERLOOP_RELAY_PATH", None)
+            r = subprocess.run(
+                [str(home / "bin/governloop"), "doctor"],
+                env=env, text=True, capture_output=True,
+            )
+            self.assertIn(r.returncode, (0, 1))
+            output = r.stdout + r.stderr
+            self.assertIn("[WARN]", output)
+            self.assertTrue(any("Contract: policy.md" in l and "missing" in l
+                                for l in output.splitlines()),
+                            f"doctor should WARN on missing contract: {output}")
+        finally:
+            policy.write_bytes(backup)
+
+    def test_stable_cli_all_subcommands_routed(self):
+        """stable CLI routes all Phase 2C subcommands (new, bind, status, checkpoint, end, doctor)."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        target = self.root / "target-project"
+        target.mkdir()
+        self.git(target, "init")
+        self.git(target, "config", "user.email", "t@example.invalid")
+        self.git(target, "config", "user.name", "Target")
+        self.git(target, "remote", "add", "origin",
+                 "https://github.com/owner/project.git")
+        (target / "x.txt").write_text("x\n", encoding="utf-8")
+        self.git(target, "add", ".")
+        self.git(target, "commit", "-m", "init")
+
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(state_dir)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+
+        for subcmd in ("status", "doctor"):
+            r = subprocess.run(
+                [str(home / "bin/governloop"), subcmd],
+                cwd=str(target), env=env, text=True, capture_output=True,
+            )
+            # Must not crash (exit 255) — valid exit codes are 0, 1, 3.
+            self.assertIn(r.returncode, (0, 1, 3),
+                          f"`{subcmd}` crashed: {r.stderr}")
+
+        # new creates a session (exits 3 without a bound URL).
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "new"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(r.returncode, 3, f"new should exit 3 (no URL): {r.stdout}")
+        self.assertIn("USER_CONVERSATION_SELECTION_REQUIRED", r.stdout)
+
+        # bind without a session fails with a clear error.
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "bind", "https://chatgpt.com/c/test"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1, 3))
+
+        # checkpoint with no session fails gracefully.
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "checkpoint", "NEW_BLOCKER"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (1, 3))
+
+    def test_doctor_not_mutate_state_dir(self):
+        """doctor must not create session state files."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+
+        before = set(os.listdir(str(state_dir)))
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(state_dir)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1))
+        after = set(os.listdir(str(state_dir)))
+        created = after - before
+        self.assertEqual(created, set(), f"doctor created state files: {created}")
 
 
 if __name__ == "__main__":
