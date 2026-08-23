@@ -320,6 +320,15 @@ PY
 publish_stable_entrypoint() {
   printf '%s\n' "$dispatcher_script" > "$dispatcher_stage"
   chmod 755 "$dispatcher_stage"
+
+  # Injection point (deterministic dispatcher-publication failure test): the
+  # stable entrypoint is published BEFORE current is switched, so this failure
+  # leaves the previous current + previous dispatcher intact and rolls back
+  # this run's published-but-uncommitted artifacts.
+  if [ "${GOVERLOOP_FAIL_PUBLISH_DISPATCHER:-0}" = "1" ]; then
+    fail "injected interrupt: stable entrypoint publication"
+  fi
+
   if ! python3 - "$dispatcher_stage" "$dispatcher_path" <<'PY'
 import os
 import sys
@@ -459,6 +468,15 @@ install_skeleton() {
   mv "$metadata_stage" "$metadata_index"
   metadata_published=1
 
+  # Publish the stable entrypoint BEFORE switching current: current is switched
+  # only after every install-owned artifact (version, metadata, stable CLI) is
+  # ready, so a failure before the atomic switch leaves the previous current and
+  # the previous stable entrypoint intact and rolls back this run's
+  # published-but-uncommitted artifacts (same fail-closed transaction as Phase
+  # 2A). The dispatcher content is static, so an already-present dispatcher is
+  # either left untouched (os.replace never ran) or replaced byte-identically.
+  publish_stable_entrypoint
+
   # Build the replacement pointer symlink in a temp location first.
   ln -s "versions/$INSTALL_ID" "$current_stage"
 
@@ -488,9 +506,6 @@ PY
   fi
 
   activated=1
-
-  # Publish the stable entrypoint shim (static; resolves through current).
-  publish_stable_entrypoint
 
   trap - EXIT HUP INT TERM
 

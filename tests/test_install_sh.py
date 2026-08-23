@@ -585,6 +585,54 @@ class Phase2BRuntimeBundleTests(InstallerSkeletonTests):
         self.assertTrue((home / "versions" / new_id).is_dir())
         self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
 
+    def test_dispatcher_publication_failure_keeps_previous_state(self):
+        """P1 fix: stable entrypoint publication is inside the activation
+        transaction. A deterministic dispatcher-publication failure must leave
+        the previous current + previous version + previous dispatcher intact
+        and must not leave a poisoned/half-committed active state."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        old_id = self.installed_id(repo, home)
+        old_target = os.readlink(home / "current")
+        dispatcher_before = (home / "bin/governloop").read_bytes()
+
+        # New immutable identity -> new INSTALL_ID.
+        (repo / "payload.txt").write_text("two\n", encoding="utf-8")
+        self.git(repo, "add", "payload.txt")
+        self.git(repo, "commit", "-m", "second")
+        new_id = self.installed_id(repo, home)
+
+        # Deterministic dispatcher-publication failure (env-gated injection).
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_FAIL_PUBLISH_DISPATCHER"] = "1"
+        failed = subprocess.run(
+            ["sh", str(repo / "scripts" / "install.sh")],
+            text=True, capture_output=True, env=env,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("injected interrupt: stable entrypoint publication", failed.stderr)
+        # Previous current unchanged; previous known-good version intact.
+        self.assertEqual(os.readlink(home / "current"), old_target)
+        self.assertTrue((home / "versions" / old_id).is_dir())
+        # Existing stable entrypoint remains byte-identical.
+        self.assertEqual((home / "bin/governloop").read_bytes(), dispatcher_before)
+        # Failed new install leaves no poisoned active state: the new version
+        # was published but not committed, so it rolled back and current never
+        # pointed at it.
+        self.assertFalse((home / "versions" / new_id).exists())
+        self.assertFalse((home / "metadata" / f"{new_id}.json").exists())
+        # No leftover stage artifacts.
+        self.assertEqual(list((home / "versions").glob(".*.stage.*")), [])
+        self.assertEqual(list(home.glob(".bin.governloop.stage.*")), [])
+
+        # Retry after the injected failure is removed succeeds and activates.
+        retry = self.installer(repo, home, check=False)
+        self.assertEqual(retry.returncode, 0)
+        self.assertTrue((home / "versions" / new_id).is_dir())
+        self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
+
 
 if __name__ == "__main__":
     unittest.main()
