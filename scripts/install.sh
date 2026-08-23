@@ -218,23 +218,32 @@ install_skeleton() {
   mv "$metadata_stage" "$metadata_index"
   metadata_published=1
 
-  # Build the replacement symlink separately, then rename it into place. Rename
-  # within one filesystem is atomic; current therefore never points at a partial
-  # version directory.
-  #
-  # NOTE: current may already be a symlink whose target is a VERSION DIRECTORY.
-  # A bare `mv -f` would follow that symlink and move the new link *into* the
-  # directory instead of replacing the pointer. So remove the existing pointer
-  # symlink first (rm never follows it into its target), then rename the temp
-  # link into place.
+  # Build the replacement pointer symlink in a temp location first.
   ln -s "versions/$INSTALL_ID" "$current_stage"
-  rm -f "$current_path"
-  mv "$current_stage" "$current_path"
 
-  # Injection point for deterministic interrupt-after-activate tests: simulate a
-  # termination between the atomic rename and the activated flag being set.
+  # Injection point (deterministic pre-replace interrupt test): simulate a
+  # termination before the atomic replacement is committed. The previously
+  # active current must remain intact; this run's published artifacts roll back.
+  if [ "${GOVERLOOP_FAIL_BEFORE_ACTIVATE:-0}" = "1" ]; then
+    fail "injected interrupt before activation replace"
+  fi
+
+  # Atomically replace the current pointer. os.replace() uses rename(2)
+  # semantics: it replaces the current symlink entry in place (never follows it
+  # into a version directory) and is atomic, so there is no remove-then-rename
+  # window where current is momentarily absent.
+  python3 - "$current_stage" "$current_path" <<'PY'
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+os.replace(src, dst)
+PY
+
+  # Injection point (deterministic post-replace interrupt test): simulate a
+  # termination between the atomic replace and the activated flag being set.
   if [ "${GOVERLOOP_FAIL_AFTER_ACTIVATE:-0}" = "1" ]; then
-    fail "injected interrupt after activation rename"
+    fail "injected interrupt after activation replace"
   fi
 
   activated=1

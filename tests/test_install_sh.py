@@ -239,13 +239,46 @@ class InstallerSkeletonTests(unittest.TestCase):
             env=env,
         )
         self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("injected interrupt after activation rename", failed.stderr)
+        self.assertIn("injected interrupt after activation replace", failed.stderr)
         # Committed: current moved to the new install (not the stale target) and
         # the published version directory is kept rather than rolled back.
         self.assertTrue((home / "current").is_symlink())
         self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
         self.assertNotEqual(os.readlink(home / "current"), old_target)
         self.assertTrue((home / "versions" / new_id).is_dir())
+
+    def test_activation_interrupt_before_replace_keeps_old_current(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        old_target = os.readlink(home / "current")
+
+        # New immutable identity -> new INSTALL_ID.
+        (repo / "payload.txt").write_text("two\n", encoding="utf-8")
+        self.git(repo, "add", "payload.txt")
+        self.git(repo, "commit", "-m", "second")
+        new_id = f"main.{self.source_short_sha(repo)}"
+
+        # Simulate a termination BEFORE the atomic replacement is committed. The
+        # previously active current must remain intact and this run's published
+        # (but not activated) artifacts must roll back.
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_FAIL_BEFORE_ACTIVATE"] = "1"
+        failed = subprocess.run(
+            ["sh", str(repo / "scripts" / "install.sh")],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("injected interrupt before activation replace", failed.stderr)
+        # Old current is untouched (still points at the prior install).
+        self.assertTrue((home / "current").is_symlink())
+        self.assertEqual(os.readlink(home / "current"), old_target)
+        # This run's published-but-not-activated artifacts are rolled back.
+        self.assertFalse((home / "versions" / new_id).exists())
+        self.assertFalse((home / "metadata" / f"{new_id}.json").exists())
 
     def test_current_symlink_traversal_rejected(self):
         repo = self.make_source_repo()
