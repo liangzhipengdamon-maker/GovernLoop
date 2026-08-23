@@ -529,7 +529,6 @@ def status_text(state, state_dir):
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     state_dir = os.environ.get("GOVERLOOP_STATE_DIR", STATE_DIR_DEFAULT)
-    os.makedirs(state_dir, exist_ok=True)
 
     p = argparse.ArgumentParser(prog="governloop", description="GovernLoop session manager + checkpoint reporter")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -561,6 +560,14 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     cwd = os.getcwd()
+
+    # doctor is strictly read-only: it must run BEFORE any state_dir creation
+    # or session-state mutation (e.g. GOVERLOOP_STATE_DIR must not be created
+    # by a doctor invocation).
+    if args.cmd == "doctor":
+        return _doctor_main()
+
+    os.makedirs(state_dir, exist_ok=True)
 
     if args.cmd == "new":
         state, created, msg = new_session(state_dir, cwd=cwd, title=getattr(args, "title", None))
@@ -620,27 +627,6 @@ def main(argv=None):
         print(text)
         return code if not ok else 0
 
-    if args.cmd == "doctor":
-        results = doctor_report()
-        has_fail = False
-        has_warn = False
-        for level, label, detail in results:
-            if level == "FAIL":
-                has_fail = True
-            elif level == "WARN":
-                has_warn = True
-            print(f"[{level}] {label}: {detail}")
-        print()
-        if has_fail:
-            print("RESULT: FAIL — one or more checks failed; GovernLoop may not function correctly")
-            return 1
-        elif has_warn:
-            print("RESULT: WARN — one or more checks have warnings; GovernLoop should work but check above")
-            return 0
-        else:
-            print("RESULT: PASS — all checks passed")
-            return 0
-
     return 0
 
 
@@ -650,6 +636,44 @@ def main(argv=None):
 # All paths resolved relative to the runtime that is currently active (i.e.
 # the directory containing THIS file after installation).  The caller\'s cwd
 # is NEVER changed and no filesystem mutation occurs.
+
+def is_valid_current_target(target):
+    """Strict installer contract for the `current` pointer.
+
+    Accepts exactly ``versions/<single-install-id>``: one non-empty path
+    component with no ``.``, ``..``, nested path, or traversal. Any other
+    shape — ``versions/``, ``versions/.``, ``versions/..``,
+    ``versions/../x``, ``versions/a/b``, or a non-``versions/*`` target — is
+    rejected, mirroring ``scripts/install.sh``. Dangling targets are a
+    separate check (shape first, then existence).
+    """
+    if not isinstance(target, str) or not target.startswith("versions/"):
+        return False
+    rest = target[len("versions/"):]
+    return bool(rest) and rest not in (".", "..") and "/" not in rest
+
+
+def _doctor_main():
+    results = doctor_report()
+    has_fail = False
+    has_warn = False
+    for level, label, detail in results:
+        if level == "FAIL":
+            has_fail = True
+        elif level == "WARN":
+            has_warn = True
+        print(f"[{level}] {label}: {detail}")
+    print()
+    if has_fail:
+        print("RESULT: FAIL — one or more checks failed; GovernLoop may not function correctly")
+        return 1
+    elif has_warn:
+        print("RESULT: WARN — one or more checks have warnings; GovernLoop should work but check above")
+        return 0
+    else:
+        print("RESULT: PASS — all checks passed")
+        return 0
+
 
 def _rel_path(path, base):
     """Return path relative to base, or the original if outside base."""
@@ -667,8 +691,8 @@ def _check_blocking(state_dir=None):
         return "FAIL", f"No active version: {current} does not exist (run the installer first)"
     if os.path.islink(current):
         target = os.readlink(current)
-        if not target.startswith("versions/"):
-            return "FAIL", f"current symlink is not installer-managed: {target}"
+        if not is_valid_current_target(target):
+            return "FAIL", f"current symlink target is malformed or uses traversal: {target}"
         if not os.path.exists(current):
             return "FAIL", f"current symlink is dangling: {target}"
     else:
@@ -709,8 +733,9 @@ def doctor_report(goverloop_home=None, state_dir=None):
     current = os.path.join(home, "current")
     if os.path.islink(current):
         target = os.readlink(current)
-        if not target.startswith("versions/"):
-            results.append(("FAIL", "current pointer", f"malformed target (not versions/*): {target}"))
+        if not is_valid_current_target(target):
+            results.append(("FAIL", "current pointer",
+                            f"malformed target (expected versions/<single-install-id>): {target}"))
         elif not os.path.exists(current):
             results.append(("FAIL", "current pointer", f"dangling symlink: {target}"))
         else:

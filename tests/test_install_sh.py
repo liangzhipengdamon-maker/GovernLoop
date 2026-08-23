@@ -953,6 +953,83 @@ class Phase2CDiagnosticsTests(Phase2BRuntimeBundleTests):
         created = after - before
         self.assertEqual(created, set(), f"doctor created state files: {created}")
 
+    def test_doctor_does_not_create_state_dir(self):
+        """doctor must NOT create a nonexistent GOVERLOOP_STATE_DIR (strictly
+        read-only, before any session-state mutation)."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+
+        state_dir = self.root / "nonexistent-state"
+        self.assertFalse(state_dir.exists())
+
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(state_dir)
+        env.pop("GOVERLOOP_RELAY_PATH", None)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "doctor"],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertIn(r.returncode, (0, 1), r.stderr)
+        self.assertFalse(
+            state_dir.exists(),
+            "doctor must not create GOVERLOOP_STATE_DIR (read-only)",
+        )
+
+    def test_doctor_current_target_validation(self):
+        """doctor rejects non-canonical current targets exactly like the
+        installer: only versions/<single-install-id> is valid."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        version_dir = home / "versions" / install_id
+        session_manager = version_dir / "runtime" / "governloop_session.py"
+
+        # Invoke the session manager directly so doctor's own validation runs
+        # (the stable CLI wrapper guards on current/bin/governloop first).
+        def run_doctor():
+            env = os.environ.copy()
+            env["GOVERLOOP_HOME"] = str(home)
+            env.pop("GOVERLOOP_RELAY_PATH", None)
+            return subprocess.run(
+                [sys.executable, str(session_manager), "doctor"],
+                env=env, text=True, capture_output=True,
+            )
+
+        # Canonical target passes.
+        r = run_doctor()
+        self.assertIn("[PASS]", r.stdout + r.stderr)
+        self.assertIn("current pointer", r.stdout)
+
+        invalid_targets = [
+            "versions/",         # empty component
+            "versions/.",        # current directory
+            "versions/..",       # parent directory
+            "versions/../x",     # traversal
+            "versions/a/b",      # nested path
+            "not-versions/x",    # non-versions target
+        ]
+        for tgt in invalid_targets:
+            os.unlink(home / "current")
+            os.symlink(tgt, home / "current")
+            r = run_doctor()
+            output = r.stdout + r.stderr
+            self.assertIn("[FAIL]", output, f"target {tgt!r} must FAIL doctor")
+            self.assertIn("current pointer", output, f"target {tgt!r}")
+        # Restore canonical state for the dangling check.
+        os.unlink(home / "current")
+        os.symlink(f"versions/{install_id}", home / "current")
+
+        # Dangling (well-shaped but missing target) must FAIL.
+        os.unlink(home / "current")
+        os.symlink("versions/does-not-exist", home / "current")
+        r = run_doctor()
+        output = r.stdout + r.stderr
+        self.assertIn("[FAIL]", output)
+        self.assertIn("dangling", output)
+
 
 if __name__ == "__main__":
     unittest.main()
