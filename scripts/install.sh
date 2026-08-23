@@ -119,24 +119,50 @@ install_skeleton() {
   bin_dir="$GOVERLOOP_HOME/bin"
   metadata_dir="$GOVERLOOP_HOME/metadata"
   version_dir="$versions_dir/$INSTALL_ID"
+  metadata_index="$metadata_dir/$INSTALL_ID.json"
   current_path="$GOVERLOOP_HOME/current"
+
+  # --- current pointer preflight (fail-closed) -------------------------------
+  # Only two states are safe to replace atomically:
+  #   * current is absent, or
+  #   * current is an installer-managed symlink (target under versions/).
+  # Any other object (regular file, directory, or an unexpected symlink) is
+  # rejected so we never silently overwrite pre-existing state with mv -f.
+  if [ -e "$current_path" ] || [ -L "$current_path" ]; then
+    if [ -L "$current_path" ]; then
+      current_target=$(readlink "$current_path")
+      case "$current_target" in
+        versions/*) : ;;  # installer-managed symlink: safe to replace atomically
+        *) fail "current is a symlink to an unexpected target; refusing: $current_target" ;;
+      esac
+    elif [ -d "$current_path" ]; then
+      fail "current exists as a directory; refusing non-atomic replacement"
+    else
+      fail "current exists as a regular file; refusing non-atomic replacement"
+    fi
+  fi
 
   mkdir -p "$versions_dir" "$bin_dir" "$metadata_dir"
 
   [ ! -e "$version_dir" ] && [ ! -L "$version_dir" ] \
     || fail "INSTALL_ID already exists and is immutable: $INSTALL_ID"
 
-  if [ -d "$current_path" ] && [ ! -L "$current_path" ]; then
-    fail "current exists as a directory; refusing non-atomic replacement"
-  fi
-
   stage_dir="$versions_dir/.${INSTALL_ID}.stage.$$"
-  metadata_stage="$metadata_dir/.${INSTALL_ID}.json.stage.$$"
+  metadata_stage="$GOVERLOOP_HOME/.${INSTALL_ID}.json.stage.$$"
   current_stage="$GOVERLOOP_HOME/.current.stage.$$"
 
+  # Track how far publication progressed so cleanup only rolls back artifacts
+  # THIS run published (never a pre-existing, completed install).
+  version_published=0
+  metadata_published=0
+  activated=0
   cleanup() {
     rm -rf "$stage_dir"
     rm -f "$metadata_stage" "$current_stage"
+    if [ "$activated" -ne 1 ]; then
+      [ "$version_published" -eq 1 ] && rm -rf "$version_dir"
+      [ "$metadata_published" -eq 1 ] && rm -f "$metadata_index"
+    fi
   }
   trap cleanup EXIT HUP INT TERM
 
@@ -148,16 +174,21 @@ install_skeleton() {
   write_metadata "$stage_dir/metadata.json" "$installed_at"
   write_metadata "$metadata_stage" "$installed_at"
 
-  # Publish immutable version and metadata before activation. If any operation
-  # above fails, current has not been touched.
+  # Publish the immutable version first. It is still recoverable: if any later
+  # step fails, cleanup removes it, so a failed install leaves no partial
+  # versions/<INSTALL_ID> and the INSTALL_ID stays retryable.
   mv "$stage_dir" "$version_dir"
-  mv "$metadata_stage" "$metadata_dir/$INSTALL_ID.json"
+  version_published=1
+
+  mv "$metadata_stage" "$metadata_index"
+  metadata_published=1
 
   # Build the replacement symlink separately, then rename it into place. Rename
   # within one filesystem is atomic; current therefore never points at a partial
   # version directory.
   ln -s "versions/$INSTALL_ID" "$current_stage"
   mv -f "$current_stage" "$current_path"
+  activated=1
 
   trap - EXIT HUP INT TERM
 

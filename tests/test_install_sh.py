@@ -140,6 +140,79 @@ class InstallerSkeletonTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("tracked working tree is dirty", result.stderr)
 
+    def test_failed_publication_cleanup(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)  # baseline activation
+
+        # Produce a new immutable identity (new INSTALL_ID).
+        (repo / "payload.txt").write_text("two\n", encoding="utf-8")
+        self.git(repo, "add", "payload.txt")
+        self.git(repo, "commit", "-m", "second")
+        new_id = self.installer(repo, home, "--print-install-id").stdout.strip()
+
+        # Block the metadata index publication so the install fails AFTER the
+        # immutable version_dir is published but BEFORE current activation.
+        os.chmod(home / "metadata", 0o500)
+        try:
+            failed = self.installer(repo, home, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            # Failed install leaves no partial immutable version behind.
+            self.assertFalse((home / "versions" / new_id).exists())
+            self.assertFalse((home / "metadata" / f"{new_id}.json").exists())
+            # Previous current pointer is preserved (never touched).
+            self.assertTrue((home / "current").is_symlink())
+        finally:
+            os.chmod(home / "metadata", 0o700)
+
+        # INSTALL_ID is retryable: a clean re-run completes successfully.
+        retry = self.installer(repo, home, check=False)
+        self.assertEqual(retry.returncode, 0)
+        self.assertTrue((home / "versions" / new_id).exists())
+        self.assertTrue((home / "metadata" / f"{new_id}.json").is_file())
+
+    def test_current_regular_file_rejected(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        home.mkdir(parents=True)
+        (home / "current").write_text("not a symlink\n", encoding="utf-8")
+
+        result = self.installer(repo, home, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("regular file", result.stderr)
+        # Fail-closed: pre-existing regular file is preserved, nothing published.
+        self.assertTrue((home / "current").is_file())
+        self.assertFalse((home / "versions").exists())
+
+    def test_current_directory_rejected(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        home.mkdir(parents=True)
+        (home / "current").mkdir()
+
+        result = self.installer(repo, home, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("directory", result.stderr)
+        # Fail-closed: pre-existing directory is preserved, nothing published.
+        self.assertTrue((home / "current").is_dir())
+        self.assertFalse((home / "versions").exists())
+
+    def test_failed_install_preserves_existing_current(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        old_target = os.readlink(home / "current")
+
+        # A tracked modification (uncommitted) forces a pre-publication failure
+        # in detect_identity. The already-activated current must remain untouched.
+        (repo / "payload.txt").write_text("dirty tracked\n", encoding="utf-8")
+
+        failed = self.installer(repo, home, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("tracked working tree is dirty", failed.stderr)
+        self.assertTrue((home / "current").is_symlink())
+        self.assertEqual(os.readlink(home / "current"), old_target)
+
 
 if __name__ == "__main__":
     unittest.main()
