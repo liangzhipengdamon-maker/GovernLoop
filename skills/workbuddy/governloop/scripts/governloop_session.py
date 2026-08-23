@@ -34,12 +34,28 @@ import urllib.request
 # --------------------------------------------------------------------------
 STATE_DIR_DEFAULT = "/tmp"
 DEFAULT_CDP_PORT = int(os.environ.get("GOVERLOOP_CDP_PORT", "9233"))
-RELAY_DEFAULT = os.path.expanduser(
-    os.environ.get(
-        "GOVERLOOP_RELAY_PATH",
+
+
+def _default_relay_path():
+    """Resolve the Neutral Relay for the current runtime.
+
+    Installed Phase 2B bundle: neutral_relay.py is a sibling of this session
+    manager inside the installed version's runtime/ directory, so the installed
+    runtime is checkout-independent (the relay must be found after the original
+    checkout is removed). Checkout-era fallback: the canonical repository
+    layout. GOVERLOOP_RELAY_PATH always overrides both.
+    """
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neutral_relay.py")
+    if os.path.exists(sibling):
+        return sibling
+    return os.path.expanduser(
         "~/Documents/02_other_projects/GovernLoop-workspace/repos/GovernLoop/"
-        "tools/neutral-relay/neutral_relay.py",
+        "tools/neutral-relay/neutral_relay.py"
     )
+
+
+RELAY_DEFAULT = os.path.expanduser(
+    os.environ.get("GOVERLOOP_RELAY_PATH", _default_relay_path())
 )
 CANONICAL_CONFIG = os.path.expanduser("~/.governloop/relay/config.json")
 

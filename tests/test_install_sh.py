@@ -1,5 +1,7 @@
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +29,27 @@ class InstallerSkeletonTests(unittest.TestCase):
             capture_output=True,
         )
 
+    # Canonical runtime sources the Phase 2B installer packages into the bundle.
+    RUNTIME_SOURCE_FILES = {
+        "scripts/install.sh": INSTALLER_SOURCE,
+        "skills/governloop/SKILL.md": REPO_ROOT / "skills/governloop/SKILL.md",
+        "skills/workbuddy/governloop/scripts/governloop_session.py": (
+            REPO_ROOT / "skills/workbuddy/governloop/scripts/governloop_session.py"
+        ),
+        "skills/workbuddy/governloop/references/policy.md": (
+            REPO_ROOT / "skills/workbuddy/governloop/references/policy.md"
+        ),
+        "tools/neutral-relay/neutral_relay.py": (
+            REPO_ROOT / "tools/neutral-relay/neutral_relay.py"
+        ),
+        "docs/architecture/neutral-relay-checkpoint-delivery.md": (
+            REPO_ROOT / "docs/architecture/neutral-relay-checkpoint-delivery.md"
+        ),
+        "docs/ops/AGENT_SAFETY_CONTRACT.md": (
+            REPO_ROOT / "docs/ops/AGENT_SAFETY_CONTRACT.md"
+        ),
+    }
+
     def make_source_repo(self, branch="main"):
         repo = self.root / f"source-{len(list(self.root.glob('source-*')))}"
         repo.mkdir()
@@ -35,9 +58,10 @@ class InstallerSkeletonTests(unittest.TestCase):
         self.git(repo, "config", "user.name", "GovernLoop Installer Test")
         self.git(repo, "checkout", "-b", branch)
 
-        scripts = repo / "scripts"
-        scripts.mkdir()
-        shutil.copyfile(INSTALLER_SOURCE, scripts / "install.sh")
+        for rel, src in self.RUNTIME_SOURCE_FILES.items():
+            dst = repo / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
         (repo / "payload.txt").write_text("one\n", encoding="utf-8")
         self.git(repo, "add", ".")
         self.git(repo, "commit", "-m", "initial")
@@ -107,7 +131,7 @@ class InstallerSkeletonTests(unittest.TestCase):
         self.assertEqual(payload["source_commit"], self.source_sha(repo))
         self.assertEqual(payload["source_type"], "untagged_checkout")
         self.assertEqual(payload["source_ref"], "main")
-        self.assertEqual(payload["installer_version"], "phase2a-skeleton-v1")
+        self.assertEqual(payload["installer_version"], "phase2b-runtime-bundle-v1")
         self.assertRegex(payload["install_timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertEqual(os.readlink(home / "current"), f"versions/{install_id}")
         self.assertTrue((home / "bin").is_dir())
@@ -308,6 +332,258 @@ class InstallerSkeletonTests(unittest.TestCase):
         # Fail-closed: pre-existing symlink is preserved, nothing published.
         self.assertTrue((home / "current").is_symlink())
         self.assertFalse((home / "versions").exists())
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B: minimal installed runtime bundle + checkout independence
+# ---------------------------------------------------------------------------
+INSTALLED_BUNDLE_FILES = {
+    "metadata.json",
+    "runtime/governloop_session.py",
+    "runtime/neutral_relay.py",
+    "skills/governloop/SKILL.md",
+    "skills/governloop/contracts/neutral-relay-checkpoint-delivery.md",
+    "skills/governloop/contracts/AGENT_SAFETY_CONTRACT.md",
+    "skills/governloop/contracts/policy.md",
+    "bin/governloop",
+}
+
+
+class Phase2BRuntimeBundleTests(InstallerSkeletonTests):
+    """Phase 2B: installed runtime bundle, stable entrypoint, checkout independence."""
+
+    def installed_id(self, repo, home):
+        return f"main.{self.source_short_sha(repo)}"
+
+    def _relative_files(self, root):
+        return {str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file()}
+
+    def _assert_installed_skill_refs_resolve(self, version_dir, home):
+        """Every backticked local path reference in the installed skill resolves
+        inside the installed bundle (or the effective GOVERLOOP_HOME).
+
+        contracts/ refs are relative to the installed skill directory
+        (skills/governloop/); runtime/ + bin/ refs are relative to the installed
+        version root. Placeholder/prose tokens (owner/repo, /governloop,
+        <SESSION_ID>, canonical relay config path) are not bundle artifacts and
+        are skipped.
+        """
+        skill = (version_dir / "skills/governloop/SKILL.md").read_text(encoding="utf-8")
+        unresolved = []
+        for m in re.finditer(r"`([^`\n]+)`", skill):
+            ref = m.group(1).strip()
+            if "<" in ref or ">" in ref:
+                continue  # template placeholder
+            if ref.endswith("config.json"):
+                continue  # runtime routing config path, not a bundle artifact
+            if not (ref.startswith(("contracts/", "runtime/", "bin/", "skills/"))
+                    or ref.startswith("~")):
+                continue  # prose / command token, not a bundle artifact
+            if ref.startswith("~"):
+                mapped = ref.replace("~/.governloop", str(home), 1)
+                if not Path(os.path.expanduser(mapped)).exists():
+                    unresolved.append(ref)
+                continue
+            base = version_dir
+            if ref.startswith("contracts/"):
+                base = version_dir / "skills/governloop"
+            if not (base / ref).exists():
+                unresolved.append(ref)
+        self.assertEqual(unresolved, [], f"unresolved installed-skill refs: {unresolved}")
+
+    def test_bundle_contains_exactly_required_artifacts(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = home / "versions" / self.installed_id(repo, home)
+        self.assertEqual(self._relative_files(version_dir), INSTALLED_BUNDLE_FILES)
+
+    def test_installed_paths_exist_and_wrapper_executable(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = home / "versions" / self.installed_id(repo, home)
+        for rel in (
+            "runtime/governloop_session.py",
+            "runtime/neutral_relay.py",
+            "skills/governloop/SKILL.md",
+            "skills/governloop/contracts/neutral-relay-checkpoint-delivery.md",
+            "skills/governloop/contracts/AGENT_SAFETY_CONTRACT.md",
+            "skills/governloop/contracts/policy.md",
+            "bin/governloop",
+        ):
+            p = version_dir / rel
+            self.assertTrue(p.is_file(), rel)
+            self.assertGreater(p.stat().st_size, 0, rel)
+        self.assertTrue(os.access(version_dir / "bin/governloop", os.X_OK))
+        self.assertTrue(os.access(home / "bin/governloop", os.X_OK))
+
+    def test_stable_command_resolution_through_current(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        # stable -> current -> version wrapper chain
+        self.assertEqual(os.readlink(home / "current"), f"versions/{install_id}")
+        target = self.root / "target-project"
+        target.mkdir()
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(self.root / "state")
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "status"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no active session for target-project", r.stdout)
+
+    def test_no_source_checkout_path_leakage(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = home / "versions" / self.installed_id(repo, home)
+        # The fixture checkout path must not appear anywhere in the bundle.
+        for p in version_dir.rglob("*"):
+            if p.is_file():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                self.assertNotIn(str(repo), text, f"source-checkout leak in {p}")
+        # Installed skill/contracts must not keep checkout-relative references.
+        skill = (version_dir / "skills/governloop/SKILL.md").read_text(encoding="utf-8")
+        for forbidden in ("docs/", "tools/", "skills/workbuddy", "README.md"):
+            self.assertNotIn(forbidden, skill)
+        for contract in (version_dir / "skills/governloop/contracts").glob("*.md"):
+            text = contract.read_text(encoding="utf-8")
+            self.assertNotIn("tools/", text)
+            self.assertNotIn("docs/", text)
+
+    def test_installed_skill_normative_refs_resolve_inside_bundle(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        self._assert_installed_skill_refs_resolve(
+            home / "versions" / self.installed_id(repo, home), home)
+
+    def test_checkout_independence_after_removing_source(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        install_id = self.installed_id(repo, home)
+        version_dir = home / "versions" / install_id
+
+        # Remove the original checkout.
+        shutil.rmtree(repo)
+
+        # Installed skill normative references still resolve inside the bundle.
+        self._assert_installed_skill_refs_resolve(version_dir, home)
+
+        # Installed runtime files still exist and are invokable.
+        self.assertTrue((version_dir / "runtime/governloop_session.py").is_file())
+        self.assertTrue((version_dir / "runtime/neutral_relay.py").is_file())
+        self.assertTrue(os.access(version_dir / "bin/governloop", os.X_OK))
+
+        # Stable entrypoint still functions from an arbitrary cwd (status).
+        target = self.root / "target-project"
+        target.mkdir()
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(self.root / "state")
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "status"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no active session for target-project", r.stdout)
+
+        # new (non-destructive session creation; exits 3 without a bound URL).
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "new"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("USER_CONVERSATION_SELECTION_REQUIRED", r.stdout)
+
+        # Relay resolution: the installed session manager finds the sibling relay.
+        saved = os.environ.pop("GOVERLOOP_RELAY_PATH", None)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "installed_gsm", str(version_dir / "runtime/governloop_session.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            if saved is not None:
+                os.environ["GOVERLOOP_RELAY_PATH"] = saved
+        self.assertEqual(
+            os.path.realpath(mod.RELAY_DEFAULT),
+            os.path.realpath(version_dir / "runtime/neutral_relay.py"),
+        )
+
+    def test_target_project_cwd_preserved(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+
+        target = self.root / "target-repo"
+        target.mkdir()
+        self.git(target, "init")
+        self.git(target, "config", "user.email", "target@example.invalid")
+        self.git(target, "config", "user.name", "Target")
+        self.git(target, "remote", "add", "origin",
+                 "https://github.com/fakeowner/fakeproject.git")
+        (target / "x.txt").write_text("x\n", encoding="utf-8")
+        self.git(target, "add", ".")
+        self.git(target, "commit", "-m", "init")
+
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        env = os.environ.copy()
+        env["GOVERLOOP_HOME"] = str(home)
+        env["GOVERLOOP_STATE_DIR"] = str(state_dir)
+        r = subprocess.run(
+            [str(home / "bin/governloop"), "new", "--title", "phase2b-check"],
+            cwd=str(target), env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("USER_CONVERSATION_SELECTION_REQUIRED", r.stdout)
+        # Session was created for the TARGET project, proving cwd preservation.
+        self.assertIn("fakeowner/fakeproject", r.stdout)
+        states = list(state_dir.glob("governloop-session-*.json"))
+        self.assertEqual(len(states), 1)
+        state = json.loads(states[0].read_text(encoding="utf-8"))
+        self.assertEqual(state["repo"], "fakeowner/fakeproject")
+        self.assertNotIn(str(home), state["repo"])
+
+    def test_failed_staging_preserves_previous_current(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        old_id = self.installed_id(repo, home)
+        old_target = os.readlink(home / "current")
+
+        # New immutable identity -> new INSTALL_ID.
+        (repo / "payload.txt").write_text("two\n", encoding="utf-8")
+        self.git(repo, "add", "payload.txt")
+        self.git(repo, "commit", "-m", "second")
+        new_id = self.installed_id(repo, home)
+
+        # Block bundle staging: the stage dir cannot be created inside versions/.
+        os.chmod(home / "versions", 0o500)
+        try:
+            failed = self.installer(repo, home, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+        finally:
+            os.chmod(home / "versions", 0o700)
+
+        # Previous current + version preserved; no partial new version.
+        self.assertEqual(os.readlink(home / "current"), old_target)
+        self.assertTrue((home / "versions" / old_id).is_dir())
+        self.assertFalse((home / "versions" / new_id).exists())
+        self.assertEqual([p for p in (home / "versions").glob(".*.stage.*")], [])
+
+        # Retryable after the blocker is cleared.
+        retry = self.installer(repo, home, check=False)
+        self.assertEqual(retry.returncode, 0)
+        self.assertTrue((home / "versions" / new_id).is_dir())
+        self.assertEqual(os.readlink(home / "current"), f"versions/{new_id}")
 
 
 if __name__ == "__main__":
