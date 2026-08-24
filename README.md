@@ -33,6 +33,14 @@ delivery. Delivery is confirmed by request-correlated read-back; reply
 completion is gated on the ChatGPT completion UI (stop button gone + copy/rate
 icons present), with a system-auto token-free screenshot fallback on truncation.
 
+## Choose your agent
+
+- **WorkBuddy** — best UX: install once, then use the `/governloop` slash command.
+- **OpenCode** — install the `skills/opencode/governloop/` skill.
+- **Claude Code / Codex / any local agent** — invoke the session manager CLI directly.
+- **DeepSeek Harness (DSH)** — install GovernLoop Core first, then the
+  [GovernLoop-DSH](https://github.com/liangzhipengdamon-maker/GovernLoop-DSH) adapter.
+
 ## Works with
 
 | Agent | Entry point |
