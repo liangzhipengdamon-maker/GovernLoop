@@ -1,5 +1,6 @@
 #!/usr/import/env python3
 import argparse
+import base64
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import time
 import urllib.request
 import websockets
 import asyncio
+from collections import deque
 
 # Canonical local routing authority for GovernLoop Minimal Transport.
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.governloop/relay/config.json")
@@ -15,10 +17,41 @@ DEFAULT_CONFIG_PATH = os.path.expanduser("~/.governloop/relay/config.json")
 #   NORMAL       (no soft streaming/busy markers): short settle.
 #   CONSERVATIVE (one or more soft markers remain): long settle so a brief
 #                generation pause cannot be mistaken for "done".
-NORMAL_STABLE_READS = 3
-NORMAL_SETTLE_SECONDS = 4.0
+# B4 (GPT-reply-truncation fix): the settle window is the BACKSTOP only — the
+# authoritative completion gate is the UI feature set (stop button gone AND
+# copy/rate icons present), see ResponseCompletionTracker.observe(). Thresholds
+# are env-overridable (GOVERLOOP_STABLE_READS / GOVERLOOP_SETTLE_SECONDS) for
+# safe tuning without code changes.
+NORMAL_STABLE_READS = 4
+NORMAL_SETTLE_SECONDS = 8.0
 CONSERVATIVE_STABLE_READS = 6
 CONSERVATIVE_SETTLE_SECONDS = 30.0
+
+# F3: post-finalize confirmation — after a candidate finalize, the same node
+# must stay text-identical across these extra reads before the response is
+# written (revocable finalize; a resumed stream cancels it).
+CONFIRM_READS = 3
+CONFIRM_INTERVAL_SECONDS = 2.0
+
+# B4 auto-fallback: how long the relay keeps re-reading the same node for a
+# recovered (non-truncated) reply after detecting a truncated shape. Env-
+# tunable via GOVERLOOP_RECOVERY_SECONDS.
+RECOVERY_SECONDS = 15.0
+
+
+def _looks_truncated(text):
+    """B4 truncation heuristic: does the reply look like a JSON-shaped message
+    (review envelope) interrupted mid-string? Cheap structural signal only —
+    brace balance on text that starts with '{'. Prose without braces is
+    balanced and never triggers. Used to AUTO-enable the screenshot fallback
+    (no consent, proactive) — a false positive only costs one small PNG plus a
+    short re-read."""
+    if not isinstance(text, str):
+        return False
+    s = text.strip()
+    if not s or not s.startswith("{"):
+        return False
+    return s.count("{") > s.count("}")
 
 # Strong delivery confirmation (see run_relay): "send button clicked" is NOT
 # "message delivered". A click that lands while ChatGPT is still processing
@@ -95,6 +128,17 @@ class ResponseCompletionTracker:
         has_assistant = bool(snapshot.get("hasAssistant"))
         soft_generating = bool(snapshot.get("softGenerating"))
 
+        # B4 hard completion gate (F1): ChatGPT renders the action bar (copy /
+        # rate icons) only after it finalizes an assistant message, and removes
+        # the stop button while streaming. finalize is therefore allowed only
+        # when the text is stable AND the stop button is gone AND copy/rate
+        # icons are present. This replaces the fragile "text stable alone"
+        # signal that mistook a streaming pause for completion (A-class false
+        # truncation). Soft markers only choose the settle window.
+        stop_present = bool(snapshot.get("stopPresent"))
+        has_copy_rate = bool(snapshot.get("hasCopyRate"))
+        features_done = (not stop_present) and has_copy_rate
+
         # Correlation: this send must have produced a new user turn followed by
         # an assistant turn. The response itself is NOT required to echo
         # REVIEW_REQUEST_ID (supports generic transport).
@@ -123,7 +167,7 @@ class ResponseCompletionTracker:
             required_reads = self.normal_stable_reads
             required_settle = self.normal_settle_seconds
 
-        if self.stable_reads >= required_reads and stable_for >= required_settle:
+        if self.stable_reads >= required_reads and stable_for >= required_settle and features_done:
             return True, text
 
         return False, ""
@@ -439,6 +483,11 @@ async def run_relay(args):
         
     async with websockets.connect(ws_url, max_size=2**30, open_timeout=10) as ws:
         _id = 0
+        # B4 (F4 observability, opt-in): ring buffer of SSE events received
+        # during the run, to prove whether the server stopped the stream
+        # (response.incomplete / output_item.done) or the tracker mis-judged.
+        sse_diag = bool(args.sse_diag)
+        sse_events = deque(maxlen=100) if sse_diag else None
         async def cmd(method, params=None, session=None):
             nonlocal _id
             _id += 1
@@ -452,6 +501,12 @@ async def run_relay(args):
             while True:
                 raw = await asyncio.wait_for(ws.recv(), timeout=30)
                 data = json.loads(raw)
+                if data.get("method") == "Network.eventSourceMessageReceived" and sse_events is not None:
+                    p = data.get("params", {})
+                    sse_events.append({
+                        "name": p.get("eventName"),
+                        "data": str(p.get("data"))[:200],
+                    })
                 if data.get("id") == mid:
                     return data
 
@@ -472,6 +527,32 @@ async def run_relay(args):
             return ev.get("result", {}).get("result", {}).get("value")
 
         await cmd("Page.enable", {}, session=sid)
+        if sse_diag:
+            try:
+                await cmd("Network.enable", {}, session=sid)
+            except Exception:
+                print("WARN: Network.enable failed; SSE diagnostics disabled for this run.")
+
+        async def _capture_screenshot(name):
+            """B4 (F6, token-free): PNG capture. ALWAYS available for anomaly
+            paths (truncation detection, read-back timeout) — system-initiated,
+            no user consent and no waiting for a request. GOVERLOOP_SCREENSHOT_DIR
+            only adds extra forensics captures; production default is zero
+            screenshots on the normal path. Never analysed automatically."""
+            try:
+                shot = await cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True}, session=sid)
+                data = (shot.get("result") or {}).get("data")
+                if not data:
+                    return None
+                base = args.screenshot_dir or os.path.dirname(os.path.abspath(args.output_file))
+                os.makedirs(base, exist_ok=True)
+                p = os.path.join(base, f"{name}.png")
+                with open(p, "wb") as f:
+                    f.write(base64.b64decode(data))
+                return p
+            except Exception as exc:
+                print(f"WARN: screenshot capture failed: {exc}")
+                return None
 
         # ── OPTIONAL: upload evidence attachments before sending text ────────
         # Each --attachment is uploaded through the ChatGPT file input via CDP
@@ -571,6 +652,15 @@ async def run_relay(args):
                     assistant.getAttribute('data-is-streaming') === 'true' ||
                     assistant.getAttribute('aria-busy') === 'true'
                 ));
+                // B4 (F1): ChatGPT renders the action bar (copy / rate icons)
+                // only after the message is finalized. Multi-selector fallback
+                // in case ChatGPT renames these controls.
+                const copyRate = document.querySelector(
+                    'button[aria-label*="Copy"], button[aria-label*="复制"], ' +
+                    '[data-testid*="copy"], [data-testid*="like"], [data-testid*="thumbs"], ' +
+                    'button[aria-label*="评价"], button[aria-label*="点赞"], button[aria-label*="点踩"], ' +
+                    'button[aria-label*="Like"], button[aria-label*="Thumbs"]'
+                );
                 return {
                     userCount:users.length,
                     lastUserText:lastUserText,
@@ -578,7 +668,9 @@ async def run_relay(args):
                     hasAssistant:!!assistant,
                     softGenerating:(!!stop || streaming),
                     stopPresent:!!stop,
-                    streamingMarker:streaming
+                    streamingMarker:streaming,
+                    hasCopyRate:!!copyRate,
+                    visibilityState:document.visibilityState
                 };
             })()""")
 
@@ -608,7 +700,14 @@ async def run_relay(args):
         deadline = time.time() + args.wait_timeout
         found_response = False
         final_text = ""
-        completion = ResponseCompletionTracker()
+        diag_recovery = "n/a"
+        # B4 (F2): thresholds are env-tunable for safe rollback without code
+        # changes; defaults moved to 8s / 4 reads (streaming-pause tolerance).
+        completion = ResponseCompletionTracker(
+            normal_stable_reads=int(os.environ.get("GOVERLOOP_STABLE_READS", NORMAL_STABLE_READS)),
+            normal_settle_seconds=float(os.environ.get("GOVERLOOP_SETTLE_SECONDS", NORMAL_SETTLE_SECONDS)),
+        )
+        diag_path = args.output_file + ".diag.jsonl"
         while time.time() < deadline:
             snapshot = await _snapshot()
 
@@ -618,19 +717,76 @@ async def run_relay(args):
                 req_id=req_id,
             )
             if complete:
-                final_text = settled_text
-                found_response = True
-                break
+                # B4 (F3): post-finalize confirmation — the same node must stay
+                # text-identical across CONFIRM_READS more reads before we write
+                # the response. A resumed stream cancels the finalize (revocable).
+                confirmed = True
+                confirm_text = settled_text
+                for _ in range(CONFIRM_READS):
+                    await asyncio.sleep(CONFIRM_INTERVAL_SECONDS)
+                    snap2 = await _snapshot()
+                    c2, t2 = completion.observe(snap2, user_count_before, req_id)
+                    if not c2:
+                        confirmed = False
+                        break
+                    confirm_text = t2
+                if confirmed:
+                    final_text = confirm_text
+                    # B4 auto-fallback (F6, system-initiated — no user consent,
+                    # no waiting for a request): if the reply still looks
+                    # truncated (e.g. an envelope JSON cut mid-string), the relay
+                    # proactively captures a token-free screenshot AND performs a
+                    # short recovery re-read of the same node. This is the
+                    # proactive remediation for GPT conversation truncation.
+                    if _looks_truncated(final_text):
+                        await _capture_screenshot(f"{req_id}-truncated")
+                        diag_recovery = "truncated-evidence"
+                        recovery_deadline = time.time() + RECOVERY_SECONDS
+                        while time.time() < recovery_deadline:
+                            await asyncio.sleep(2)
+                            t2 = str((await _snapshot()).get("text") or "").strip()
+                            if t2 and not _looks_truncated(t2):
+                                final_text = t2
+                                diag_recovery = "recovered"
+                                break
+                    else:
+                        diag_recovery = "none"
+                    found_response = True
+                    break
+                # else: text resumed -> keep waiting on the outer loop
 
             await asyncio.sleep(2)
-            
+
+        # B4 (F4): diagnostics — finalize/timeout state snapshot + optional SSE
+        # tail, for proving A-class (tracker) vs B-class (server) truncation.
+        try:
+            with open(diag_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "req_id": req_id,
+                    "status": "finalized" if found_response else "timeout",
+                    "recovery": diag_recovery,
+                    "ts": time.time(),
+                    "text_len": len(final_text) if found_response else None,
+                    "text_head": (final_text or "")[:200] if found_response else None,
+                    "snapshot": {
+                        "stopPresent": bool((await _snapshot()).get("stopPresent")),
+                        "hasCopyRate": bool((await _snapshot()).get("hasCopyRate")),
+                        "visibilityState": (await _snapshot()).get("visibilityState"),
+                        "userCount": (await _snapshot()).get("userCount"),
+                    },
+                    "sse_tail": list(sse_events) if sse_events is not None else None,
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"WARN: diagnostics write failed: {exc}")
+
         if not found_response:
             print(f"Error: Timed out after {args.wait_timeout}s waiting for a new stable Assistant response to settle.")
+            await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
             return 1
-            
+
         with open(args.output_file, "w") as f:
             f.write(final_text)
-            
+
         print(f"Success: Wrote response to {args.output_file}")
         return 0
 
@@ -659,6 +815,13 @@ def main():
     parser.add_argument("--cdp-port", type=int, default=None,
                         help="session-level CDP port override for this run "
                              "(never written to config)")
+    parser.add_argument("--screenshot-dir", default=os.environ.get("GOVERLOOP_SCREENSHOT_DIR"),
+                        help="B4 F6: when set, capture token-free PNG evidence at finalize/timeout "
+                             "(never analysed automatically)")
+    parser.add_argument("--sse-diag", action="store_true",
+                        default=os.environ.get("GOVERLOOP_SSE_DIAG") == "1",
+                        help="B4 F4: record SSE event tail into the diagnostics file "
+                             "to distinguish tracker vs server truncation")
     args = parser.parse_args()
     sys.exit(asyncio.run(run_relay(args)))
 

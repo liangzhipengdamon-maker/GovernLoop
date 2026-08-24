@@ -268,6 +268,8 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
             "text": '{ "verdict": "BLOCK", "confidence": "high", "rationale": "ok", "required_fixes": [] }',
             "hasAssistant": True,
             "softGenerating": False,
+            "hasCopyRate": True,   # B4 F1: completion features gate finalize
+            "stopPresent": False,
         }
         fake = FakeSequenced(cleared=[True], users=[9] * 30, assistants=[3] * 30, streaming=False)
         conf = self._conf(fake, snap, req_id, pending_timeout=12)
@@ -292,6 +294,8 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
             "text": "an unrelated assistant reply",
             "hasAssistant": True,
             "softGenerating": False,
+            "hasCopyRate": True,
+            "stopPresent": False,
         }
         fake = FakeSequenced(cleared=[True], users=[9] * 30, assistants=[3] * 30, streaming=False)
         conf = self._conf(fake, snap, req_id, pending_timeout=3)
