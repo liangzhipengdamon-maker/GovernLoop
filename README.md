@@ -11,6 +11,20 @@ to finish streaming, and writes the complete response to a local output file —
 wrapped in a session manager that handles repo/task detection, session ids,
 conversation binding, review checkpoints, and evidence delivery.
 
+## Product boundary
+
+**Borrow only what the bridge needs. Nothing beyond the bridge.**
+
+GovernLoop only adds the governance capabilities strictly required to bridge a
+local Agent with ChatGPT Web safely and reliably. Governance outside this bridge
+boundary is out of scope.
+
+If the target Agent/runtime already provides a required bridge capability
+natively, GovernLoop uses or adapts that native capability instead of duplicating
+it. Native runtime responsibilities such as session lifecycle, agent lineage,
+transcripts, sandboxing, approvals, or multi-agent coordination remain native
+unless a concrete bridge requirement proves a missing capability.
+
 ## Works with
 
 | Agent | Entry point |
