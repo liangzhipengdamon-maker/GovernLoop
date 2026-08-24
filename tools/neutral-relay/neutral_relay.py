@@ -201,9 +201,10 @@ class SendConfirmation:
     unit-testable without a live browser (same pattern as AttachmentUploader).
 
     Returned status is one of: DELIVERY_CONFIRMED_PRIMARY,
-    DELIVERY_CONFIRMED_AUXILIARY, SEND_NOT_CONFIRMED, SEND_PENDING_TIMEOUT,
-    SEND_BUTTON_UNAVAILABLE. `delivered` is True only for the two DELIVERY_*
-    statuses.
+    DELIVERY_CONFIRMED_AUXILIARY, DELIVERY_CONFIRMED_RECONCILED,
+    SEND_NOT_CONFIRMED, SEND_PENDING_TIMEOUT,
+    SEND_BUTTON_UNAVAILABLE. `delivered` is True only for the three
+    DELIVERY_* statuses.
     """
 
     def __init__(
@@ -217,6 +218,8 @@ class SendConfirmation:
         ui_transition_seconds=SEND_UI_TRANSITION_SECONDS,
         sleep=asyncio.sleep,
         now=time.time,
+        snapshot=None,
+        req_id=None,
     ):
         self.click_send = click_send
         self.composer_cleared = composer_cleared
@@ -227,6 +230,8 @@ class SendConfirmation:
         self.ui_transition_seconds = ui_transition_seconds
         self.sleep = sleep
         self.now = now
+        self.snapshot = snapshot
+        self.req_id = req_id
 
     async def confirm(self, user_count_before):
         """Run the state machine. Returns (delivered, primary, status)."""
@@ -270,6 +275,14 @@ class SendConfirmation:
             print("SEND_PENDING: draft has left the composer; awaiting thread confirmation "
                   "(no auto re-click to avoid duplicate delivery).")
             user_now = assistant_now = 0
+            # B1 reconciliation: delivery may also be confirmed when the
+            # REQUEST-CORRELATED read-back is observed — our REVIEW_REQUEST_ID
+            # present in the thread's last user message AND the corresponding
+            # assistant reply read back (settled). This binds delivery proof to
+            # THIS request/turn; an unrelated new assistant message never counts
+            # (the tracker requires req_id in lastUserText + has_assistant +
+            # non-empty settled text).
+            completion = ResponseCompletionTracker()
             pending_deadline = self.now() + self.pending_timeout
             while self.now() < pending_deadline:
                 user_now, assistant_now = await self.turn_counts()
@@ -283,6 +296,17 @@ class SendConfirmation:
                     print("DELIVERY_CONFIRMED_AUXILIARY: PASS (composer cleared; new assistant "
                           "turn after send; no assistant streaming before send)")
                     return True, False, "DELIVERY_CONFIRMED_AUXILIARY"
+                if self.snapshot is not None and self.req_id:
+                    ok, _text = completion.observe(
+                        await self.snapshot(),
+                        user_count_before=user_count_before,
+                        req_id=self.req_id,
+                    )
+                    if ok:
+                        print("DELIVERY_CONFIRMED_RECONCILED: PASS (request-correlated read-back "
+                              "observed: REVIEW_REQUEST_ID present in the thread + corresponding "
+                              "assistant reply read back)")
+                        return True, False, "DELIVERY_CONFIRMED_RECONCILED"
                 await self.sleep(1)
             print("SEND_PENDING_TIMEOUT: draft has left the composer but the thread has "
                   f"not confirmed delivery within {self.pending_timeout}s "
@@ -523,33 +547,8 @@ async def run_relay(args):
         async def _assistant_streaming():
             return bool(await js("(()=>{let s=false;document.querySelectorAll('[data-message-author-role=\\'assistant\\']').forEach(x=>{if(x.matches('.streaming-animation')||x.querySelector('.streaming-animation')||x.getAttribute('data-is-streaming')==='true'||x.getAttribute('aria-busy')==='true')s=true;});const st=document.querySelector('button[data-testid=\\'stop-button\\'],button[data-testid=\\'stop-generation\\'],button[aria-label*=\\'Stop\\'],button[aria-label*=\\'停止\\']');return s||!!st;})()"))
 
-        confirmation = SendConfirmation(
-            click_send=_click_send,
-            composer_cleared=_composer_cleared,
-            turn_counts=_turn_counts,
-            assistant_streaming=_assistant_streaming,
-            confirm_timeout=send_confirm_timeout,
-            pending_timeout=send_pending_timeout,
-        )
-        delivered, _primary, send_status = await confirmation.confirm(user_count_before)
-        if not delivered:
-            # SEND_BUTTON_UNAVAILABLE / SEND_NOT_CONFIRMED / SEND_PENDING_TIMEOUT
-            # (state machine already printed the detailed reason).
-            return 1
-
-        # Poll for the assistant response following the user turn created by
-        # this send. Correlation remains user-turn -> following Assistant turn.
-        # Completion is text-first: a text change is hard evidence that output
-        # is still live and restarts the settle window. ChatGPT DOM stop/busy/
-        # streaming markers are only soft evidence because they may remain stale
-        # after a visibly complete response. Soft markers therefore require a
-        # longer stable-text settle window, but cannot block finalization forever.
-        deadline = time.time() + args.wait_timeout
-        found_response = False
-        final_text = ""
-        completion = ResponseCompletionTracker()
-        while time.time() < deadline:
-            snapshot = await js("""(()=>{
+        async def _snapshot():
+            return await js("""(()=>{
                 const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
                 const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user');
                 const lastUser = users.length ? users[users.length - 1] : null;
@@ -582,6 +581,36 @@ async def run_relay(args):
                     streamingMarker:streaming
                 };
             })()""")
+
+        confirmation = SendConfirmation(
+            click_send=_click_send,
+            composer_cleared=_composer_cleared,
+            turn_counts=_turn_counts,
+            assistant_streaming=_assistant_streaming,
+            confirm_timeout=send_confirm_timeout,
+            pending_timeout=send_pending_timeout,
+            snapshot=_snapshot,
+            req_id=req_id,
+        )
+        delivered, _primary, send_status = await confirmation.confirm(user_count_before)
+        if not delivered:
+            # SEND_BUTTON_UNAVAILABLE / SEND_NOT_CONFIRMED / SEND_PENDING_TIMEOUT
+            # (state machine already printed the detailed reason).
+            return 1
+
+        # Poll for the assistant response following the user turn created by
+        # this send. Correlation remains user-turn -> following Assistant turn.
+        # Completion is text-first: a text change is hard evidence that output
+        # is still live and restarts the settle window. ChatGPT DOM stop/busy/
+        # streaming markers are only soft evidence because they may remain stale
+        # after a visibly complete response. Soft markers therefore require a
+        # longer stable-text settle window, but cannot block finalization forever.
+        deadline = time.time() + args.wait_timeout
+        found_response = False
+        final_text = ""
+        completion = ResponseCompletionTracker()
+        while time.time() < deadline:
+            snapshot = await _snapshot()
 
             complete, settled_text = completion.observe(
                 snapshot,
