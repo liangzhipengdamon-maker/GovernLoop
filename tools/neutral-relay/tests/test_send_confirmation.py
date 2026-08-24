@@ -235,3 +235,70 @@ class TestSendConfirmation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSendConfirmationReconciliation(TestSendConfirmation):
+    """B1: request-correlated read-back reconciliation in SEND_PENDING."""
+
+    def _conf(self, fake, snap, req_id, pending_timeout=10):
+        async def _snap():
+            return snap
+        conf = neutral_relay.SendConfirmation(
+            click_send=fake.click_send,
+            composer_cleared=fake.composer_cleared,
+            turn_counts=fake.turn_counts,
+            assistant_streaming=fake.assistant_streaming,
+            confirm_timeout=1,
+            pending_timeout=pending_timeout,
+            ui_transition_seconds=0.0,
+            snapshot=_snap,
+            req_id=req_id,
+        )
+        return conf
+
+    def test_pending_request_correlated_readback_reconciles(self):
+        # composer cleared, no user-turn/assistant-count signal, but the
+        # REQUEST-CORRELATED read-back is observed (REVIEW_REQUEST_ID in the
+        # thread's last user message + a settled assistant reply) ->
+        # DELIVERY_CONFIRMED_RECONCILED. Never re-clicked.
+        req_id = "WS-A65-PRODUCT-CLOSURE-E2E-2026-08-24-BEFORE_DESTRUCTIVE_ACTION-1"
+        snap = {
+            "userCount": 9,
+            "lastUserText": f"evidence.txt 文档 REVIEW_REQUEST_ID: {req_id} REPO: ws CHECKPOINT: BEFORE_DESTRUCTIVE_ACTION",
+            "text": '{ "verdict": "BLOCK", "confidence": "high", "rationale": "ok", "required_fixes": [] }',
+            "hasAssistant": True,
+            "softGenerating": False,
+        }
+        fake = FakeSequenced(cleared=[True], users=[9] * 30, assistants=[3] * 30, streaming=False)
+        conf = self._conf(fake, snap, req_id, pending_timeout=12)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = asyncio.run(conf.confirm(9))
+        delivered, primary, status = result
+        self.assertTrue(delivered)
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertIn("DELIVERY_CONFIRMED_RECONCILED: PASS", buf.getvalue())
+        self.assertEqual(fake.clicks, 1)  # no re-click after composer cleared
+
+    def test_pending_unrelated_assistant_message_does_not_reconcile(self):
+        # safety boundary: an assistant reply WITHOUT our REVIEW_REQUEST_ID in
+        # the thread's last user message must NOT count as delivery proof ->
+        # SEND_PENDING_TIMEOUT (fail-closed, no resend, no false positive).
+        req_id = "REQ-123"
+        snap = {
+            "userCount": 9,
+            "lastUserText": "some unrelated conversation message",
+            "text": "an unrelated assistant reply",
+            "hasAssistant": True,
+            "softGenerating": False,
+        }
+        fake = FakeSequenced(cleared=[True], users=[9] * 30, assistants=[3] * 30, streaming=False)
+        conf = self._conf(fake, snap, req_id, pending_timeout=3)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = asyncio.run(conf.confirm(9))
+        delivered, primary, status = result
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+        self.assertEqual(fake.clicks, 1)
