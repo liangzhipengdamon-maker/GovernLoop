@@ -11,13 +11,17 @@ import neutral_relay
 
 
 class TestResponseCompletionTracker(unittest.TestCase):
-    def snapshot(self, text, *, user_count=2, last_user_text="RID-1", soft=False, has_assistant=True):
+    def snapshot(self, text, *, user_count=2, last_user_text="RID-1", soft=False, has_assistant=True,
+                 has_copy_rate=True, stop_present=False):
         return {
             "userCount": user_count,
             "lastUserText": last_user_text,
             "text": text,
             "hasAssistant": has_assistant,
             "softGenerating": soft,
+            # B4 (F1): completion features are now the hard finalize gate.
+            "hasCopyRate": has_copy_rate,
+            "stopPresent": stop_present,
         }
 
     # --- NORMAL stage (no soft markers) ---
@@ -27,15 +31,37 @@ class TestResponseCompletionTracker(unittest.TestCase):
         snap = self.snapshot("Short answer", soft=False)
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=0), (False, ""))
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=2), (False, ""))
-        # 3 consecutive identical reads + 4s stable -> finalize.
-        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=4), (True, "Short answer"))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=4), (False, ""))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=6), (False, ""))
+        # 5 consecutive identical reads + 8s stable + features -> finalize (B4: 8s/4 reads).
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=8), (True, "Short answer"))
 
-    def test_normal_does_not_finalize_before_3_reads_or_4s(self):
+    def test_normal_does_not_finalize_before_4_reads_or_8s(self):
         tracker = neutral_relay.ResponseCompletionTracker()
         snap = self.snapshot("answer", soft=False)
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=0), (False, ""))
-        # 3 reads but only 2s stable -> not complete.
+        # 4 reads but only 6s stable -> not complete (B4: 8s settle).
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=2), (False, ""))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=4), (False, ""))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=6), (False, ""))
+
+    def test_normal_never_finalizes_without_completion_features(self):
+        # B4 (F1): stable text alone must NOT finalize — copy/rate icons present
+        # and the stop button gone gate completion. This fixes the A-class
+        # false truncation (streaming pause mistaken for "done").
+        tracker = neutral_relay.ResponseCompletionTracker()
+        snap = self.snapshot("VERDICT: PASS", soft=False, has_copy_rate=False)
+        for now in (0, 4, 8, 16, 32):
+            self.assertEqual(tracker.observe(snap, 1, "RID-1", now=now), (False, ""))
+        # stop button still present also blocks finalize.
+        snap2 = self.snapshot("VERDICT: PASS", soft=False, has_copy_rate=True, stop_present=True)
+        for now in (0, 8, 16):
+            self.assertEqual(tracker.observe(snap2, 1, "RID-1", now=now), (False, ""))
+        # once features are present, the settle gate applies (8s / 4 reads).
+        snap3 = self.snapshot("VERDICT: PASS", soft=False, has_copy_rate=True, stop_present=False)
+        for now in (0, 4, 8, 16):
+            expected = (True, "VERDICT: PASS") if now >= 8 else (False, "")
+            self.assertEqual(tracker.observe(snap3, 1, "RID-1", now=now), expected)
 
     # --- CONSERVATIVE stage (soft markers remain) ---
 
@@ -82,8 +108,10 @@ class TestResponseCompletionTracker(unittest.TestCase):
         # First two reads carry a soft marker (CONSERVATIVE would need 30s).
         self.assertEqual(tracker.observe(self.snapshot("B", soft=True), 1, "RID-1", now=0), (False, ""))
         self.assertEqual(tracker.observe(self.snapshot("B", soft=True), 1, "RID-1", now=2), (False, ""))
-        # Marker clears; NORMAL (4s + 3 reads) now applies to the already-stable text.
-        self.assertEqual(tracker.observe(self.snapshot("B", soft=False), 1, "RID-1", now=4), (True, "B"))
+        # Marker clears; NORMAL (8s + 4 reads, B4) now applies to the already-stable text.
+        self.assertEqual(tracker.observe(self.snapshot("B", soft=False), 1, "RID-1", now=4), (False, ""))
+        self.assertEqual(tracker.observe(self.snapshot("B", soft=False), 1, "RID-1", now=6), (False, ""))
+        self.assertEqual(tracker.observe(self.snapshot("B", soft=False), 1, "RID-1", now=8), (True, "B"))
 
     def test_long_conversation_user_count_has_no_turn_ceiling(self):
         # Case 5: long >20-turn conversation still correlates and finalizes.
@@ -91,7 +119,9 @@ class TestResponseCompletionTracker(unittest.TestCase):
         snap = self.snapshot("PASS", user_count=26, soft=False)
         self.assertEqual(tracker.observe(snap, 25, "RID-1", now=0), (False, ""))
         self.assertEqual(tracker.observe(snap, 25, "RID-1", now=2), (False, ""))
-        self.assertEqual(tracker.observe(snap, 25, "RID-1", now=4), (True, "PASS"))
+        self.assertEqual(tracker.observe(snap, 25, "RID-1", now=4), (False, ""))
+        self.assertEqual(tracker.observe(snap, 25, "RID-1", now=6), (False, ""))
+        self.assertEqual(tracker.observe(snap, 25, "RID-1", now=8), (True, "PASS"))
 
     def test_never_stable_response_never_completes_fail_closed(self):
         # Case 6: never-stable response -> observer never completes (caller
@@ -119,7 +149,9 @@ class TestResponseCompletionTracker(unittest.TestCase):
         snap = self.snapshot("VERDICT: PASS", soft=False)
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=0), (False, ""))
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=2), (False, ""))
-        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=4), (True, "VERDICT: PASS"))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=4), (False, ""))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=6), (False, ""))
+        self.assertEqual(tracker.observe(snap, 1, "RID-1", now=8), (True, "VERDICT: PASS"))
 
 
 class TestNeutralRelay(unittest.TestCase):
