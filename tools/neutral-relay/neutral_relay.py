@@ -33,6 +33,26 @@ CONSERVATIVE_SETTLE_SECONDS = 30.0
 CONFIRM_READS = 3
 CONFIRM_INTERVAL_SECONDS = 2.0
 
+# B4 auto-fallback: how long the relay keeps re-reading the same node for a
+# recovered (non-truncated) reply after detecting a truncated shape. Env-
+# tunable via GOVERLOOP_RECOVERY_SECONDS.
+RECOVERY_SECONDS = 15.0
+
+
+def _looks_truncated(text):
+    """B4 truncation heuristic: does the reply look like a JSON-shaped message
+    (review envelope) interrupted mid-string? Cheap structural signal only —
+    brace balance on text that starts with '{'. Prose without braces is
+    balanced and never triggers. Used to AUTO-enable the screenshot fallback
+    (no consent, proactive) — a false positive only costs one small PNG plus a
+    short re-read."""
+    if not isinstance(text, str):
+        return False
+    s = text.strip()
+    if not s or not s.startswith("{"):
+        return False
+    return s.count("{") > s.count("}")
+
 # Strong delivery confirmation (see run_relay): "send button clicked" is NOT
 # "message delivered". A click that lands while ChatGPT is still processing
 # freshly-uploaded attachments can be silently swallowed, leaving the draft in
@@ -514,17 +534,19 @@ async def run_relay(args):
                 print("WARN: Network.enable failed; SSE diagnostics disabled for this run.")
 
         async def _capture_screenshot(name):
-            """B4 (F6, token-free fallback): capture a PNG of the page when a
-            screenshot dir is configured. NEVER analysed automatically."""
-            if not args.screenshot_dir:
-                return None
+            """B4 (F6, token-free): PNG capture. ALWAYS available for anomaly
+            paths (truncation detection, read-back timeout) — system-initiated,
+            no user consent and no waiting for a request. GOVERLOOP_SCREENSHOT_DIR
+            only adds extra forensics captures; production default is zero
+            screenshots on the normal path. Never analysed automatically."""
             try:
                 shot = await cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True}, session=sid)
                 data = (shot.get("result") or {}).get("data")
                 if not data:
                     return None
-                os.makedirs(args.screenshot_dir, exist_ok=True)
-                p = os.path.join(args.screenshot_dir, f"{name}.png")
+                base = args.screenshot_dir or os.path.dirname(os.path.abspath(args.output_file))
+                os.makedirs(base, exist_ok=True)
+                p = os.path.join(base, f"{name}.png")
                 with open(p, "wb") as f:
                     f.write(base64.b64decode(data))
                 return p
@@ -678,6 +700,7 @@ async def run_relay(args):
         deadline = time.time() + args.wait_timeout
         found_response = False
         final_text = ""
+        diag_recovery = "n/a"
         # B4 (F2): thresholds are env-tunable for safe rollback without code
         # changes; defaults moved to 8s / 4 reads (streaming-pause tolerance).
         completion = ResponseCompletionTracker(
@@ -709,6 +732,25 @@ async def run_relay(args):
                     confirm_text = t2
                 if confirmed:
                     final_text = confirm_text
+                    # B4 auto-fallback (F6, system-initiated — no user consent,
+                    # no waiting for a request): if the reply still looks
+                    # truncated (e.g. an envelope JSON cut mid-string), the relay
+                    # proactively captures a token-free screenshot AND performs a
+                    # short recovery re-read of the same node. This is the
+                    # proactive remediation for GPT conversation truncation.
+                    if _looks_truncated(final_text):
+                        await _capture_screenshot(f"{req_id}-truncated")
+                        diag_recovery = "truncated-evidence"
+                        recovery_deadline = time.time() + RECOVERY_SECONDS
+                        while time.time() < recovery_deadline:
+                            await asyncio.sleep(2)
+                            t2 = str((await _snapshot()).get("text") or "").strip()
+                            if t2 and not _looks_truncated(t2):
+                                final_text = t2
+                                diag_recovery = "recovered"
+                                break
+                    else:
+                        diag_recovery = "none"
                     found_response = True
                     break
                 # else: text resumed -> keep waiting on the outer loop
@@ -722,6 +764,7 @@ async def run_relay(args):
                 f.write(json.dumps({
                     "req_id": req_id,
                     "status": "finalized" if found_response else "timeout",
+                    "recovery": diag_recovery,
                     "ts": time.time(),
                     "text_len": len(final_text) if found_response else None,
                     "text_head": (final_text or "")[:200] if found_response else None,
@@ -738,10 +781,8 @@ async def run_relay(args):
 
         if not found_response:
             print(f"Error: Timed out after {args.wait_timeout}s waiting for a new stable Assistant response to settle.")
-            await _capture_screenshot(f"{req_id}-timeout")  # F6 evidence
+            await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
             return 1
-
-        await _capture_screenshot(f"{req_id}-finalized")  # F6 evidence (opt-in)
 
         with open(args.output_file, "w") as f:
             f.write(final_text)

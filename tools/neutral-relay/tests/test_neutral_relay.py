@@ -232,3 +232,20 @@ class TestNeutralRelay(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestTruncationHeuristic(unittest.TestCase):
+    """B4 auto-fallback heuristic (_looks_truncated)."""
+
+    def test_truncated_json_shapes_are_detected(self):
+        for t in ('{"verdict":"BLOCK","',
+                  '{"verdict":"BLOCK","confidence":"',
+                  '{"verdict":"BLOCK","\n\nevidence'):
+            self.assertTrue(neutral_relay._looks_truncated(t))
+
+    def test_complete_json_and_prose_are_not_truncated(self):
+        self.assertFalse(neutral_relay._looks_truncated(
+            '{"verdict":"BLOCK","confidence":"high","rationale":"ok","required_fixes":[]}'))
+        self.assertFalse(neutral_relay._looks_truncated('plain prose reply'))
+        self.assertFalse(neutral_relay._looks_truncated(''))
+        self.assertFalse(neutral_relay._looks_truncated(None))
