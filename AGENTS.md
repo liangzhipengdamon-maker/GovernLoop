@@ -28,3 +28,9 @@ Key rules:
   requires relay exit success plus canonical output written.
 - Do not reintroduce the historical AgentOps lifecycle/authority/runtime stack
   just to enforce these rules.
+- GovernLoop only adds the governance capabilities strictly required to bridge a
+  local Agent with ChatGPT Web safely and reliably. Governance outside this
+  bridge boundary is out of scope.
+- If the target Agent/runtime already provides a required bridge capability
+  natively, GovernLoop must use or adapt that native capability instead of
+  duplicating it.
