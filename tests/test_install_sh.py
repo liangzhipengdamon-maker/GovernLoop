@@ -464,6 +464,18 @@ class Phase2BRuntimeBundleTests(InstallerSkeletonTests):
         self._assert_installed_skill_refs_resolve(
             home / "versions" / self.installed_id(repo, home), home)
 
+    def test_installed_universal_skill_has_trigger_phrase(self):
+        """The installed universal skill (the artifact every agent links via
+        install-agent-skills.sh) must carry the exact one-sentence trigger
+        phrase so description-based agents fire on "Use GovernLoop for this
+        task"."""
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = home / "versions" / self.installed_id(repo, home)
+        skill = (version_dir / "skills/governloop/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Use GovernLoop for this task", skill)
+
     def test_checkout_independence_after_removing_source(self):
         repo = self.make_source_repo()
         home = self.root / "home"

@@ -1,16 +1,17 @@
 ---
 name: governloop
 description: >-
-  Universal GovernLoop protocol skill. Use it to create a task/session-level
-  review loop between the local coding agent and a ChatGPT conversation:
-  detect repo + task, generate a session id, bind a ChatGPT conversation URL
-  once per session, report the five review checkpoints (NEW_BLOCKER /
-  UNEXPECTED_STATE / BEFORE_DESTRUCTIVE_ACTION / REVIEW_REQUIRED /
-  FINAL_VERIFICATION) with evidence attachments through the Neutral Relay,
-  and clean up temporary state on end. Agent-agnostic: agent-specific
-  installation and invocation may be provided by agent-specific adapters;
-  existing integrations remain in their current locations during the Phase 1A
-  transition.
+  Universal GovernLoop protocol skill. Use when the user says
+  "Use GovernLoop for this task" (or otherwise asks to start a GovernLoop
+  review loop): create a task/session-level review loop between the local
+  coding agent and a ChatGPT conversation: detect repo + task, generate a
+  session id, bind a ChatGPT conversation URL once per session, report the
+  five review checkpoints (NEW_BLOCKER / UNEXPECTED_STATE /
+  BEFORE_DESTRUCTIVE_ACTION / REVIEW_REQUIRED / FINAL_VERIFICATION) with
+  evidence attachments through the Neutral Relay, and clean up temporary state
+  on end. Agent-agnostic: agent-specific installation and invocation may be
+  provided by agent-specific adapters; existing integrations remain in their
+  current locations during the Phase 1A transition.
 ---
 
 # GovernLoop — Universal Protocol Skill

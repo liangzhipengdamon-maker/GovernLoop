@@ -1,9 +1,10 @@
 ---
 name: governloop
 description: >-
-  Use GovernLoop to create a task/session-level review session for the current
-  repository, bind a ChatGPT conversation URL once per session, and report
-  review checkpoints (NEW_BLOCKER / UNEXPECTED_STATE / BEFORE_DESTRUCTIVE_ACTION /
+  Use when the user says "Use GovernLoop for this task": create a
+  task/session-level review session for the current repository, bind a ChatGPT
+  conversation URL once per session, and report review checkpoints
+  (NEW_BLOCKER / UNEXPECTED_STATE / BEFORE_DESTRUCTIVE_ACTION /
   REVIEW_REQUIRED / FINAL_VERIFICATION) with evidence attachments to the bound
   conversation through the Neutral Relay.
 ---
