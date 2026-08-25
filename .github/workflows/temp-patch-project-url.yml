@@ -1,0 +1,50 @@
+name: TEMP patch ChatGPT Project URL support
+
+on:
+  push:
+    branches: [fix/chatgpt-project-conversation-url]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[project-url-patch]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/chatgpt-project-conversation-url
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Patch session-manager URL validator
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('skills/workbuddy/governloop/scripts/governloop_session.py')
+          s = p.read_text()
+          old_re = 'CHATGPT_URL_RE = re.compile(r"^https?://(chatgpt\\.com|c\\.chatgpt\\.com|chat\\.openai\\.com)/c/[\\w-]+")'
+          new_re = 'CHATGPT_URL_RE = re.compile(r"^https?://(chatgpt\\.com|c\\.chatgpt\\.com|chat\\.openai\\.com)/(?:g/[\\w-]+/)?c/[\\w-]+/?(?:[?#].*)?$")'
+          old_check = '    if not CHATGPT_URL_RE.match(url):\n        return None, "ERROR: not a valid ChatGPT conversation URL (expected https://chatgpt.com/c/<id>)"\n    state["conversation_url"] = url.strip()'
+          new_check = '    url = url.strip()\n    if not CHATGPT_URL_RE.fullmatch(url):\n        return None, (\n            "ERROR: not a valid ChatGPT conversation URL "\n            "(expected https://chatgpt.com/c/<id> or "\n            "https://chatgpt.com/g/<project-or-gpt-id>/c/<id>)"\n        )\n    state["conversation_url"] = url'
+
+          if old_re not in s:
+              raise SystemExit('expected CHATGPT_URL_RE source not found')
+          if old_check not in s:
+              raise SystemExit('expected bind_url validation source not found')
+
+          s = s.replace(old_re, new_re, 1).replace(old_check, new_check, 1)
+          p.write_text(s)
+          PY
+      - name: Run focused tests
+        run: |
+          python3 -m unittest tests.test_chatgpt_project_conversation_url
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add skills/workbuddy/governloop/scripts/governloop_session.py
+          git commit -m "fix: accept ChatGPT Project conversation URLs [project-url-patch]"
+          git push origin HEAD:fix/chatgpt-project-conversation-url
