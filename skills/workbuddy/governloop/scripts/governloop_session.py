@@ -79,7 +79,7 @@ ISSUE_TOKEN_RE = re.compile(r"\b(?:[A-Z]{2,5})-(\d+)\b")   # LEA-91, AGE-53, GL-
 ISSUE_WORD_RE = re.compile(r"\bissue[_-]?(\d+)\b", re.I)    # issue-128 / issue_128
 PR_NUM_RE = re.compile(r"#(\d+)")                           # #128
 
-CHATGPT_URL_RE = re.compile(r"^https?://(chatgpt\.com|c\.chatgpt\.com|chat\.openai\.com)/c/[\w-]+")
+CHATGPT_URL_RE = re.compile(r"^https?://(chatgpt\.com|c\.chatgpt\.com|chat\.openai\.com)/(?:g/[\w-]+/)?c/[\w-]+/?(?:[?#].*)?$")
 
 
 # --------------------------------------------------------------------------
@@ -275,9 +275,14 @@ def bind_url(state_dir, session_id, url, cdp_port=None):
     state = load_state(state_dir, session_id)
     if not state:
         return None, f"ERROR: no session {session_id} (run `new` first)"
-    if not CHATGPT_URL_RE.match(url):
-        return None, "ERROR: not a valid ChatGPT conversation URL (expected https://chatgpt.com/c/<id>)"
-    state["conversation_url"] = url.strip()
+    url = url.strip()
+    if not CHATGPT_URL_RE.fullmatch(url):
+        return None, (
+            "ERROR: not a valid ChatGPT conversation URL "
+            "(expected https://chatgpt.com/c/<id> or "
+            "https://chatgpt.com/g/<project-or-gpt-id>/c/<id>)"
+        )
+    state["conversation_url"] = url
     if cdp_port:
         state["cdp_port"] = int(cdp_port)
     state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
