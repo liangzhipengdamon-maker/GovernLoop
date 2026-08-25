@@ -19,6 +19,8 @@ jobs:
         run: python3 -m unittest discover -s tools/neutral-relay/tests
       - name: ChatGPT Project conversation URL tests
         run: python3 -m unittest tests.test_chatgpt_project_conversation_url
+      - name: Full checkpoint response readback tests
+        run: python3 -m unittest tests.test_full_response_readback
 
   installer-tests:
     runs-on: ubuntu-latest
