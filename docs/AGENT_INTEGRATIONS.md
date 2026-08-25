@@ -9,99 +9,119 @@ repo → task → session → conversation → checkpoints → evidence → end
 
 Rules that hold for **every** agent:
 
-- **One session model, one session manager.** All entry points wrap the same
-  `tools`/`skills/.../governloop_session.py` CLI. There is no per-agent
-  fork.
-- **No per-agent permanent routing config.** A conversation URL is
-  **session-level state**: asked once per session, stored in temporary
-  session state, never written to `~/.governloop/relay/config.json`, never
-  inherited across sessions or repos.
-- **Five checkpoints** are reported the same way from every agent:
+- **One universal protocol skill.** Agent integrations expose the installed
+  `~/.governloop/current/skills/governloop/` skill rather than forking protocol
+  logic per agent.
+- **One stable execution interface.** The skill drives the installed
+  `~/.governloop/bin/governloop` CLI; the CLI drives the shared session manager
+  and Neutral Relay.
+- **No per-agent permanent routing config.** A conversation URL is session-level
+  temporary state and is never inherited across unrelated sessions or repos.
+- **Five checkpoints** are reported consistently:
   `NEW_BLOCKER`, `UNEXPECTED_STATE`, `BEFORE_DESTRUCTIVE_ACTION`,
-  `REVIEW_REQUIRED`, `FINAL_VERIFICATION`. Ordinary progress is never sent.
-- **Evidence delivery** follows one attachment policy (exists → relevant →
-  secret scan → record; fail-closed on any refusal).
+  `REVIEW_REQUIRED`, `FINAL_VERIFICATION`.
+- **Native first.** When an agent/runtime already has the required native plugin
+  or skill mechanism, GovernLoop adapts that mechanism instead of duplicating
+  runtime behavior.
 
-## WorkBuddy — `/governloop` slash command (fastest UX)
+## Universal installation
 
-The first-class command entrypoint. Install the skill into
-`~/.workbuddy/skills/governloop/`, then:
-
-```text
-cd <project>
-/governloop          # create/resume session; asks ChatGPT URL once if missing
-/governloop status
-/governloop end
-```
-
-The agent runs `scripts/governloop_session.py` under the hood — you never see
-the CLI. See `docs/QUICK_START.md`.
-
-## OpenCode — GovernLoop skill
-
-A minimal skill is maintained in:
-
-```text
-skills/opencode/governloop/SKILL.md
-```
-
-It documents the Neutral Relay workflow for OpenCode agents (request file →
-relay → response read-back). For the higher-level session model (checkpoints,
-session ids, URL-once-per-session), invoke the same session manager CLI from
-the skill.
-
-## Claude Code — invoke the local session manager CLI
-
-No special plugin needed. The agent (or a CLAUDE.md instruction) calls the
-session manager directly:
+From a GovernLoop checkout:
 
 ```bash
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py bind https://chatgpt.com/c/<id>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py checkpoint REVIEW_REQUIRED --message "..." --attach <evidence...>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py end
+sh install.sh
 ```
 
-Recommended: add a short instruction to the project's `CLAUDE.md` telling the
-agent to run `new` at task start, report the five checkpoints with
-`--attach`, and run `end` on completion — exactly the behavior the WorkBuddy
-skill encodes, but invoked explicitly.
+The user-facing installer first installs GovernLoop Core, then asks which agents
+the user wants to integrate. For skill-based agents it creates a native user
+skill link to the same installed universal skill.
 
-## Codex — invoke the local session manager CLI
+The installer is fail-closed around existing user state: it never overwrites an
+existing skill directory or a different symlink.
 
-Same as Claude Code: call the CLI directly (e.g. from a `AGENTS.md` /
-`codex.md` instruction or a one-liner):
+## WorkBuddy
+
+Native skill path:
+
+```text
+~/.workbuddy/skills/governloop
+```
+
+After installation, use the GovernLoop skill normally; WorkBuddy may expose it
+as `/governloop`.
+
+## OpenCode
+
+Native skill path:
+
+```text
+~/.config/opencode/skills/governloop
+```
+
+The installed path points to the same universal GovernLoop skill used by the
+other skill-based agents.
+
+## Claude Code
+
+Native skill path:
+
+```text
+~/.claude/skills/governloop
+```
+
+Open the target project in Claude Code and ask it to use GovernLoop. The skill
+uses the stable installed CLI underneath; no project-local copy of the GovernLoop
+protocol is required.
+
+## Codex
+
+Native skill path:
+
+```text
+~/.codex/skills/governloop
+```
+
+Open the target project in Codex and ask it to use GovernLoop. The same universal
+skill and stable CLI are used.
+
+## DeepSeek Harness
+
+DeepSeek Harness already provides a native plugin mechanism. GovernLoop therefore
+does **not** install a generic skill into DSH. Use the GovernLoop-DSH adapter:
 
 ```bash
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py status
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py checkpoint BEFORE_DESTRUCTIVE_ACTION --message "..." --attach <evidence>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py end --final
+dsh plugin --profile <name> add governloop-dsh@0.1.1
 ```
 
-## Any generic local coding agent
+This keeps DSH runtime/session/plugin responsibilities native while GovernLoop
+provides only the bridge to GPT Web.
 
-Two levels:
+## Other local coding agents
 
-1. **Session manager (recommended)** — the full model above: session ids,
-   URL-once, checkpoints, evidence, cleanup. Just invoke the same CLI.
-2. **Neutral Relay (low-level)** — raw request → response transport with a
-   route config: `tools/neutral-relay/neutral_relay.py --request-file ...`.
-   This is the underlying API; you normally do not need it directly. See the
-   "Neutral Relay" section in the README.
+If another agent supports a user-level skill directory compatible with the
+GovernLoop `SKILL.md` contract, expose
+`~/.governloop/current/skills/governloop/` through that native mechanism.
+Otherwise the agent can invoke the stable installed CLI directly:
+
+```text
+~/.governloop/bin/governloop
+```
+
+Direct CLI use is the fallback execution interface, not the preferred normal
+user experience.
 
 ## Shared session model
 
-Regardless of entry point, a session lifecycle looks like:
+Regardless of the agent, the lifecycle remains:
 
 ```text
-new            # detect repo + task, generate <PROJECT>-<TASK>-<YYYY-MM-DD>
-bind <url>     # conversation URL asked once, temp state only
+new            # detect repo + task, generate session identity
+bind <url>     # conversation URL once, temp state only
 checkpoint     # five types, evidence attachments, same bound conversation
-status         # repo/task/session/URL/last checkpoint
+status         # diagnostics
 end            # optional FINAL_VERIFICATION + temp state cleanup
 ```
 
-Every agent reports to the **same** conversation it was bound to, follows the
-**same** attachment policy, and cleans up in the **same** way — so switching
-agents mid-project does not fork the session or the routing state.
+Switching agents does not create a different GovernLoop protocol or a separate
+routing authority. The bridge remains one installed runtime, one universal skill,
+and one task/session-level conversation binding.
