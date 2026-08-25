@@ -33,7 +33,7 @@ jobs:
 
           skill = Path('skills/workbuddy/governloop/SKILL.md')
           t = skill.read_text()
-          needle = '''If `governloop bind` rejects a URL, report the CLI's actual error to the user.\nDo not invent a workaround from an older skill version.\n'''
+          needle = '''The second form is used by ChatGPT Project/custom-GPT conversation pages. Keep\nthe full URL intact; do not rewrite it to `/c/<id>` before binding. If the CLI\nrejects a URL, surface its actual error instead of inventing an older workaround.\n'''
           replacement = needle + '''\n## Checkpoint response readback\n\nTreat the `governloop checkpoint` command's stdout as the normal readback\nboundary. On success it prints the complete assistant reply between\n`RESPONSE_BEGIN` and `RESPONSE_END`. Consume that text directly. Do **not** open\n`/tmp/governloop-response-*` or other GovernLoop temp files merely to obtain the\nreply; those files are internal evidence/state and may cross the agent sandbox\nboundary.\n'''
           if needle not in t:
               raise SystemExit('expected skill URL guidance block not found')
@@ -42,7 +42,7 @@ jobs:
       - name: Run focused tests
         run: |
           python3 -m unittest tests.test_full_response_readback
-          python3 -m unittest skills.workbuddy.governloop.scripts.test_governloop_session
+          python3 skills/workbuddy/governloop/scripts/test_governloop_session.py
       - name: Commit patch
         run: |
           git config user.name "github-actions[bot]"
