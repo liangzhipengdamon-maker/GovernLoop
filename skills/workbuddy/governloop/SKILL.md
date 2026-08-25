@@ -1,39 +1,40 @@
 ---
 name: governloop
 description: >-
-  First-class GovernLoop skill entrypoint. Create or resume a session for the
-  current repository and task, bind a ChatGPT conversation URL once per session,
+  First-class GovernLoop command entrypoint. Run "/governloop" to auto-create a
+  session for the current repository and task (session id <PROJECT>-<TASK>-<DATE>
+  is generated automatically), bind a ChatGPT conversation URL once per session,
   and report review checkpoints (NEW_BLOCKER / UNEXPECTED_STATE /
   BEFORE_DESTRUCTIVE_ACTION / REVIEW_REQUIRED / FINAL_VERIFICATION) with evidence
-  attachments to the bound conversation through the installed GovernLoop Core.
-  Use when the user asks to use GovernLoop or needs GovernLoop review/session
-  routing for the current repo.
+  attachments to the bound conversation through the GovernLoop Neutral Relay.
+  Use when the user types /governloop (new|status|bind|end) or needs a GovernLoop
+  review session / checkpoint reporting / session routing for the current repo.
 agent_created: true
 ---
 
 # GovernLoop session manager + checkpoint reporter
 
-Normal user workflow:
+Normal user workflow (user types only two commands):
 
 ```text
-open project in coding agent
-"Use GovernLoop for this task."
-work normally
+cd <project>
+/governloop          # creates/resumes the session, asks once for the conversation URL if missing
+work normally        # (agent reports checkpoints automatically)
+/governloop end      # optional FINAL_VERIFICATION + removes temp session state
 ```
 
-The skill drives the installed CLI at `~/.governloop/bin/governloop`. The user
-should not need to invoke internal Python files or know runtime paths.
+For agents that expose GovernLoop as a native skill rather than a slash command,
+the equivalent user request is simply: `Use GovernLoop for this task.`
 
 ## Commands
 
 | Command | Behavior |
 |---|---|
-| `governloop new` | Create or resume a session for the current repo/task. If no conversation URL is bound, ask the user once. |
-| `governloop status` | Show repo, task, session id, conversation bound state, last checkpoint, and temp state path. |
-| `governloop bind <conversation-url>` | Store the ChatGPT conversation URL in temporary session state only and optionally CDP-check that it is open. |
-| `governloop checkpoint <TYPE> ...` | Report a review checkpoint through Neutral Relay. |
-| `governloop end [--final] ...` | Optionally send FINAL_VERIFICATION, then remove temporary session state. |
-| `governloop doctor` | Read-only diagnostics. |
+| `/governloop` | Create or resume a session for the current repo. Detects repo (git origin → `owner/repo`), detects task (env issue id → branch → `--title` → deterministic slug), and generates the session id `<PROJECT>-<TASK>-<YYYY-MM-DD>`. If no conversation URL is bound, print `USER_CONVERSATION_SELECTION_REQUIRED` and ask the user once. |
+| `/governloop status` | Show repo, task, session id, conversation bound (yes/no), last checkpoint, temp state path. |
+| `/governloop bind <conversation-url>` | Store the ChatGPT URL in the temp session state only. Never writes the canonical config. Optionally CDP-verifies the conversation is open. |
+| `/governloop checkpoint <TYPE> [--message ...\|--message-file ...] [--attach PATH ...]` | Report a review checkpoint (text + evidence attachments) to the bound conversation via the Neutral Relay. |
+| `/governloop end [--final] [--attach ...]` | Send `FINAL_VERIFICATION` if `--final` and bound, then remove the temp session state. Never modifies the canonical config. |
 
 ## Session rules (mandatory)
 
@@ -42,17 +43,18 @@ should not need to invoke internal Python files or know runtime paths.
    to `~/.governloop/relay/config.json`.
 2. Reuse an existing session only when: same repo + same task/session + valid
    temp state exists. Never inherit a conversation URL across unrelated sessions
-   or repos.
+   or repos (new session starts unbounded).
 3. Session state lives at `/tmp/governloop-session-<SESSION_ID>.json`
-   (override with `GOVERLOOP_STATE_DIR`).
-4. `governloop end` removes temporary session state; canonical routing config is
+   (override with `GOVERLOOP_STATE_DIR`). Request/response/config temp files for
+   checkpoints are also written there.
+4. `/governloop end` removes the temp state; the canonical routing config is
    never touched.
 
-## ChatGPT conversation URLs
+## Conversation URL runtime truth
 
-Do not pre-reject a user-provided ChatGPT URL based on remembered or cached
-rules. Pass the exact URL to the **currently installed** `governloop bind`
-command and treat that command's result as runtime truth.
+Do not pre-reject a user-provided ChatGPT conversation URL from remembered or
+cached instructions. Pass the exact URL to the currently installed GovernLoop
+CLI and treat that CLI result as runtime truth.
 
 Current Core accepts both common conversation shapes:
 
@@ -62,22 +64,21 @@ https://chatgpt.com/g/<project-or-gpt-id>/c/<conversation-id>
 ```
 
 The second form is used by ChatGPT Project/custom-GPT conversation pages. Keep
-that full URL intact; do not rewrite it to `/c/<id>` before binding.
-
-If `governloop bind` rejects a URL, report the CLI's actual error to the user.
-Do not invent a workaround from an older skill version.
+the full URL intact; do not rewrite it to `/c/<id>` before binding. If the CLI
+rejects a URL, surface its actual error instead of inventing an older workaround.
 
 ## Install / upgrade reload rule
 
-When GovernLoop Core or this skill has just been installed or upgraded from
-inside a running coding-agent session, that session may still have an older
-skill cached. If the installer prints `AGENT_RELOAD_REQUIRED`, stop GovernLoop
-setup in that session and tell the user to restart/reload the agent once. After
-restart, continue from `Use GovernLoop for this task.`
+If installation or upgrade output includes `AGENT_RELOAD_REQUIRED`, do not
+continue GovernLoop setup in that same running agent session. Tell the user to
+restart/reload the agent once, then continue from `Use GovernLoop for this task.`
+The files may already be updated on disk while the current agent session still
+has an older skill cached in memory.
 
 ## Checkpoint reporting
 
-Automatically report only these checkpoint types:
+Automatically report (text + relevant evidence attachments to the bound
+conversation) when any of these occur:
 
 - `NEW_BLOCKER`
 - `UNEXPECTED_STATE`
@@ -85,36 +86,60 @@ Automatically report only these checkpoint types:
 - `REVIEW_REQUIRED`
 - `FINAL_VERIFICATION`
 
-Ordinary progress must not be sent.
+Ordinary progress must NOT be sent to the conversation (avoid noise). Only the
+five checkpoint types are sent.
 
-Evidence attachment rules:
+Evidence attachment policy (see `references/policy.md` for the full contract):
 
-- file exists → relevant → secret scan → attach;
-- never attach `.env`, tokens, credential backups, browser profiles, caches,
-  `node_modules`, secret configs, or irrelevant raw logs;
-- a local path in text does not count as attachment delivery;
-- any required attachment failure means `CHECKPOINT_DELIVERY_INCOMPLETE`.
+- Before attaching: file exists → relevant → secret scan → record
+  filename/size/sha256. The script refuses missing files and files containing
+  secret patterns (PATs, `sk-`, `AKIA`, `Bearer`, ...) — for secret-bearing
+  evidence, create a `.redacted` copy and attach only that.
+- Never attach: `.env`, tokens, credential backups, browser profiles, caches,
+  `node_modules`, secret configs, irrelevant raw logs.
+- A local path written in the text does NOT count as attachment delivery.
+- Success = `TEXT_RELAY: PASS` AND all required attachments delivered; any
+  attachment failure → `CHECKPOINT_DELIVERY_INCOMPLETE` (never a false
+  COMPLETE), and the relay is not invoked.
 
-## Workflow for the agent
+## Invocation
 
-1. Run `~/.governloop/bin/governloop new`.
-2. If it reports `USER_CONVERSATION_SELECTION_REQUIRED`, ask the user once for
-   the ChatGPT conversation URL and immediately run
-   `~/.governloop/bin/governloop bind "<exact-user-url>"`.
-3. Trust the current CLI result rather than prior session memory.
-4. During work, report only the five defined checkpoints with concise status and
-   relevant secret-safe evidence.
-5. At the end, run `governloop end` or `governloop end --final` when appropriate.
+The agent runs the bundled script directly (do not make the user do this):
+
+```bash
+python3 <skill-dir>/scripts/governloop_session.py <subcommand> [args]
+```
+
+The installed stable CLI `~/.governloop/bin/governloop` is also valid and should
+be preferred when the universal installed skill is being used by OpenCode,
+Claude Code, Codex, or another agent integration.
 
 Environment:
 
-- `GOVERLOOP_STATE_DIR` — temp session state dir (default `/tmp`)
-- `GOVERLOOP_CDP_PORT` — CDP port (default `9233`, with installed config fallback)
-- `GOVERLOOP_RELAY_PATH` — optional Neutral Relay override
-- `LINEAR_ISSUE_ID` / `GITHUB_ISSUE_ID` / `ISSUE_ID` / `TASK_ID` — task identity inputs
+- `GOVERLOOP_STATE_DIR` — session state dir (default `/tmp`)
+- `GOVERLOOP_CDP_PORT` — CDP port (default `9233`, falls back to the canonical
+  config's `runtime.cdp_port`, then 9233)
+- `GOVERLOOP_RELAY_PATH` — path to `neutral_relay.py` (default
+  `~/Documents/02_other_projects/GovernLoop-workspace/repos/GovernLoop/tools/neutral-relay/neutral_relay.py`)
+- `LINEAR_ISSUE_ID` / `GITHUB_ISSUE_ID` / `ISSUE_ID` / `TASK_ID` — task identity
+  from the current task context (highest priority)
 
-Exit codes: `0` success, `1` error (including
-`CHECKPOINT_DELIVERY_INCOMPLETE`), `3` `USER_CONVERSATION_SELECTION_REQUIRED`.
+Exit codes: `0` success, `1` error (incl. `CHECKPOINT_DELIVERY_INCOMPLETE`),
+`3` `USER_CONVERSATION_SELECTION_REQUIRED`.
+
+## Workflow for the agent
+
+1. On `/governloop` (or equivalent native-skill request): run `new`. If it prints
+   `USER_CONVERSATION_SELECTION_REQUIRED`, ask the user for the exact ChatGPT
+   conversation URL **once**, then run `bind <url>`. Do not pre-validate against
+   cached URL rules; use the currently installed CLI result. Confirm CDP target
+   open before the first real checkpoint.
+2. During work: when a checkpoint type occurs, run
+   `checkpoint <TYPE> --message "<concise status>" --attach <evidence...>`
+   (attach only relevant, secret-safe evidence; max a few files).
+3. On `/governloop end`: run `end --final --attach <final-report> <manifest>`
+   if a final report is appropriate, otherwise `end`. Verify the temp state file
+   is gone and the canonical config was untouched.
 
 See `QUICK_START.md` for the user-facing guide and `references/policy.md` for
-full routing/checkpoint/evidence contracts.
+the full session-routing / checkpoint / attachment-delivery contract.
