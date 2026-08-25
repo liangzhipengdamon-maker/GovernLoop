@@ -15,3 +15,5 @@ jobs:
           python-version: "3.11"
       - name: Relay + session-manager tests
         run: python3 -m unittest discover -s tools/neutral-relay/tests
+      - name: Installer + scripts tests
+        run: python3 -m unittest discover -s tests -p "test_*.py"

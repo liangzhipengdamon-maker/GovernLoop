@@ -2,13 +2,16 @@
 set -eu
 
 # GovernLoop installer (Phase 2A skeleton + Phase 2B minimal installed runtime
-# bundle). Phase 2A scope: installation identity, immutable version directories,
-# metadata, and atomic current activation. Phase 2B stages an explicit-allowlist
-# runtime bundle (runtime/ + skills/governloop/ + bin/governloop) so a successful
-# install is checkout-independent. It intentionally installs no Chrome profile,
-# shell integration, or agent adapters.
+# bundle + Phase 2E agent skill activation). Phase 2A scope: installation
+# identity, immutable version directories, metadata, and atomic current
+# activation. Phase 2B stages an explicit-allowlist runtime bundle (runtime/ +
+# skills/governloop/ + bin/governloop) so a successful install is
+# checkout-independent. Phase 2E optionally registers the installed skill into
+# agent skill directories (--agents / --register-agents): a thin UX wrapper the
+# user must explicitly request. The installer intentionally installs no Chrome
+# profile or shell integration.
 
-INSTALLER_VERSION="phase2b-runtime-bundle-v1"
+INSTALLER_VERSION="phase2e-agent-skill-activation-v1"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SOURCE_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 GOVERLOOP_HOME=${GOVERLOOP_HOME:-"$HOME/.governloop"}
@@ -124,6 +127,8 @@ RUNTIME_BUNDLE_SOURCES="
 skills/workbuddy/governloop/scripts/governloop_session.py
 tools/neutral-relay/neutral_relay.py
 skills/governloop/SKILL.md
+skills/workbuddy/governloop/SKILL.md
+skills/workbuddy/governloop/QUICK_START.md
 docs/architecture/neutral-relay-checkpoint-delivery.md
 docs/ops/AGENT_SAFETY_CONTRACT.md
 skills/workbuddy/governloop/references/policy.md
@@ -184,6 +189,8 @@ stage_runtime_bundle() {
 
   mkdir -p "$stage_dir/runtime" \
            "$stage_dir/skills/governloop/contracts" \
+           "$stage_dir/skills/workbuddy/governloop/references" \
+           "$stage_dir/skills/workbuddy/governloop/scripts" \
            "$stage_dir/bin"
 
   cp "$SOURCE_ROOT/skills/workbuddy/governloop/scripts/governloop_session.py" \
@@ -279,6 +286,16 @@ skill += (
     "The installed skill's normative references resolve only inside this bundle; "
     "the original Git checkout is not required after installation.\n"
 )
+skill += (
+    "\n## 10. Agent skill activation\n\n"
+    "When the installer ran with `--agents=codex,claude,workbuddy` (or `all`), "
+    "this skill was symlinked into the agent's skill directory, so the user can "
+    "start a session by saying \"Use GovernLoop for this task\". The WorkBuddy "
+    "flavor (slash-command skill) is registered for WorkBuddy. The registration "
+    "manifest is written under the installation metadata directory. Re-run the "
+    "installer with `--register-agents=<list>` to register after the agent is "
+    "installed, or `--unregister-agents=<list>` to remove the links.\n"
+)
 leftover = sorted(set(re.findall(r"(?:docs/|tools/|skills/workbuddy|README\.md)", skill)))
 if leftover:
     fail("installed universal skill still references checkout paths: " + ", ".join(leftover))
@@ -311,7 +328,45 @@ leftover = sorted(set(re.findall(r"(?:docs/|scripts/|tools/)", po)))
 if leftover:
     fail("installed policy contract still references checkout paths: " + ", ".join(leftover))
 write(os.path.join(stage, "skills/governloop/contracts/policy.md"), po)
+
+# --- installed WorkBuddy flavor (slash-command skill) ----------------------
+# Phase 2E: the installer also stages the WorkBuddy skill flavor so
+# `--agents=workbuddy` can register it checkout-independently. Same
+# fail-closed rewrite policy: leftover checkout-relative references abort.
+wb = read(os.path.join(source_root, "skills/workbuddy/governloop/SKILL.md"))
+wb = re.sub(
+    r"`[^`]*tools/neutral-relay/neutral_relay\.py`",
+    "`~/.governloop/current/runtime/neutral_relay.py`",
+    wb,
+)
+leftover = sorted(set(re.findall(r"(?:docs/|tools/|skills/workbuddy|README\.md)", wb)))
+if leftover:
+    fail("installed workbuddy skill still references checkout paths: " + ", ".join(leftover))
+write(os.path.join(stage, "skills/workbuddy/governloop/SKILL.md"), wb)
+
+qstart = read(os.path.join(source_root, "skills/workbuddy/governloop/QUICK_START.md"))
+leftover = sorted(set(re.findall(r"(?:docs/|tools/|README\.md)", qstart)))
+if leftover:
+    fail("installed workbuddy quick start still references checkout paths: " + ", ".join(leftover))
+write(os.path.join(stage, "skills/workbuddy/governloop/QUICK_START.md"), qstart)
+
+wb_policy = read(os.path.join(source_root, "skills/workbuddy/governloop/references/policy.md"))
+wb_policy = wb_policy.replace(
+    "`neutral_relay.py`",
+    "`~/.governloop/current/runtime/neutral_relay.py`",
+)
+wb_policy = wb_policy.replace(
+    "`docs/architecture/neutral-relay-checkpoint-delivery.md`",
+    "`~/.governloop/current/skills/governloop/contracts/neutral-relay-checkpoint-delivery.md`",
+)
+leftover = sorted(set(re.findall(r"(?:docs/|tools/|README\.md)", wb_policy)))
+if leftover:
+    fail("installed workbuddy policy still references checkout paths: " + ", ".join(leftover))
+write(os.path.join(stage, "skills/workbuddy/governloop/references/policy.md"), wb_policy)
 PY
+
+  cp "$stage_dir/runtime/governloop_session.py" \
+     "$stage_dir/skills/workbuddy/governloop/scripts/governloop_session.py"
 
   printf '%s\n' "$version_wrapper_script" > "$stage_dir/bin/governloop"
   chmod 755 "$stage_dir/bin/governloop"
@@ -524,8 +579,237 @@ PY
 
   printf '%s\n' "GovernLoop installer activated: $INSTALL_ID"
   printf '%s\n' "Home: $GOVERLOOP_HOME"
-  printf '%s\n' "Bundle: runtime/ + skills/governloop/ + bin/governloop (Phase 2B runtime bundle)"
-  printf '%s\n' "NOTE: installs no Chrome profile, shell config, or agent adapters."
+  printf '%s\n' "Bundle: runtime/ + skills/{governloop,workbuddy/governloop}/ + bin/governloop (Phase 2B runtime bundle)"
+  printf '%s\n' "NOTE: installs no Chrome profile or shell config; agent skill links are installed only when requested (--agents / --register-agents)."
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2E: agent skill activation (post-install registration).
+# ---------------------------------------------------------------------------
+# Opt-in only: the installer never writes outside $GOVERLOOP_HOME unless the
+# user explicitly requests agent registration (--agents / --register-agents).
+# Registration is a THIN UX WRAPPER (Phase 2D Option A): the installed skill
+# simply tells the agent to invoke the installed session manager CLI. No deep
+# per-agent integration and no protocol changes. Agent skill roots can be
+# redirected via GOVERLOOP_<AGENT>_SKILLS_DIR (tests/CI use this to stay
+# hermetic; the agent skill dirs themselves are never part of the bundle).
+AGENT_SKILLS_VALID="codex claude workbuddy"
+agent_manifest_path="$GOVERLOOP_HOME/metadata/agent-skills.json"
+
+agent_skill_root() {
+  case "$1" in
+    codex)     printf '%s' "${GOVERLOOP_CODEX_SKILLS_DIR:-$HOME/.codex/skills}" ;;
+    claude)    printf '%s' "${GOVERLOOP_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" ;;
+    workbuddy) printf '%s' "${GOVERLOOP_WORKBUDDY_SKILLS_DIR:-$HOME/.workbuddy/skills}" ;;
+    *) fail "unknown agent: $1" ;;
+  esac
+}
+
+# Bundle-relative flavor registered for each agent: the universal protocol
+# skill for description-triggered agents (Codex/Claude Code), the slash-command
+# flavor for WorkBuddy.
+agent_skill_flavor() {
+  case "$1" in
+    codex|claude) printf '%s' "skills/governloop" ;;
+    workbuddy)    printf '%s' "skills/workbuddy/governloop" ;;
+    *) fail "unknown agent: $1" ;;
+  esac
+}
+
+# Print "absent" | "ours" | "conflict" for the skill link path.
+skill_link_state() {
+  if [ -L "$1" ]; then
+    cur=$(readlink "$1")
+    case "$cur" in
+      "$GOVERLOOP_HOME/current/skills/"*) printf '%s\n' "ours" ;;
+      *) printf '%s\n' "conflict" ;;
+    esac
+  elif [ -e "$1" ]; then
+    printf '%s\n' "conflict"
+  else
+    printf '%s\n' "absent"
+  fi
+}
+
+# Atomic manifest update (stage + os.replace), mirroring write_metadata.
+agent_manifest_update() {
+  action=$1 agent=$2 link=$3 target=$4 timestamp=$5
+  python3 - "$action" "$agent" "$link" "$target" "$timestamp" "$agent_manifest_path" <<'PY'
+import json
+import os
+import sys
+
+action, agent, link, target, timestamp, path = sys.argv[1:]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+payload = {}
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+registered = payload.setdefault("registered", {})
+if action == "register":
+    registered[agent] = {
+        "link": link,
+        "target": target,
+        "registered_at": timestamp,
+    }
+elif action == "unregister":
+    registered.pop(agent, None)
+if not registered:
+    payload.pop("registered", None)
+    if not payload:
+        os.remove(path)
+        raise SystemExit(0)
+stage = path + ".stage." + str(os.getpid())
+with open(stage, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(stage, path)
+PY
+}
+
+register_agent_skill() {
+  agent=$1
+  root=$(agent_skill_root "$agent")
+  flavor=$(agent_skill_flavor "$agent")
+  link="$root/governloop"
+  target="$GOVERLOOP_HOME/current/$flavor"
+  if [ ! -d "$target" ]; then
+    fail "installed bundle lacks $flavor (reinstall with the current installer): $target"
+  fi
+  mkdir -p "$root"
+  case "$(skill_link_state "$link")" in
+    ours) return 0 ;;  # idempotent re-registration
+    conflict) fail "refusing to overwrite a path not managed by GovernLoop: $link" ;;
+  esac
+  # Atomic symlink publication (temp link + os.replace), same pattern as the
+  # stable entrypoint dispatcher.
+  python3 - "$link" "$target" <<'PY'
+import os
+import sys
+
+link, target = sys.argv[1], sys.argv[2]
+stage = link + ".stage." + str(os.getpid())
+os.symlink(target, stage)
+try:
+    os.replace(stage, link)
+except BaseException:
+    try:
+        os.remove(stage)
+    except OSError:
+        pass
+    raise
+PY
+  agent_manifest_update register "$agent" "$link" "$target" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  registered_agents="$registered_agents $agent"
+}
+
+unregister_agent_skill() {
+  agent=$1
+  root=$(agent_skill_root "$agent")
+  link="$root/governloop"
+  if [ -L "$link" ]; then
+    cur=$(readlink "$link")
+    case "$cur" in
+      "$GOVERLOOP_HOME/current/skills/"*)
+        rm -f "$link"
+        agent_manifest_update unregister "$agent" "$link" "" ""
+        ;;
+      *)
+        fail "refusing to remove a symlink not managed by GovernLoop: $link -> $cur" ;;
+    esac
+  elif [ -e "$link" ]; then
+    fail "refusing to remove a non-symlink user path: $link"
+  fi
+}
+
+# Agents whose skill root already exists OR whose redirect env is set.
+detect_installed_agents() {
+  for agent in $AGENT_SKILLS_VALID; do
+    root=$(agent_skill_root "$agent")
+    override=0
+    case "$agent" in
+      codex)     [ -n "${GOVERLOOP_CODEX_SKILLS_DIR:-}" ] && override=1 ;;
+      claude)    [ -n "${GOVERLOOP_CLAUDE_SKILLS_DIR:-}" ] && override=1 ;;
+      workbuddy) [ -n "${GOVERLOOP_WORKBUDDY_SKILLS_DIR:-}" ] && override=1 ;;
+    esac
+    if [ "$override" -eq 1 ] || [ -d "$root" ]; then
+      printf '%s ' "$agent"
+    fi
+  done
+}
+
+require_active_install() {
+  if [ ! -L "$GOVERLOOP_HOME/current" ]; then
+    fail "no active installation (missing $GOVERLOOP_HOME/current); run install first"
+  fi
+}
+
+# Expand a user agent spec into $expanded_agents. Validation runs in the
+# CALLING shell (never inside a command substitution), so fail() exits the
+# installer with a non-zero status instead of being swallowed by ||.
+expand_agent_spec() {
+  spec=$1
+  [ -n "$spec" ] || fail "empty agent list (valid: $AGENT_SKILLS_VALID or all)"
+  if [ "$spec" = "all" ]; then
+    agents=$(detect_installed_agents)
+    if [ -z "$agents" ]; then
+      printf '%s\n' "No agents detected (no skill dirs found); nothing to do."
+      return 1
+    fi
+    expanded_agents="$agents"
+    return 0
+  fi
+  expanded_agents=""
+  IFS=,
+  for agent in $spec; do
+    case " $AGENT_SKILLS_VALID " in
+      *" $agent "*) expanded_agents="$expanded_agents $agent" ;;
+      *) unset IFS; fail "unknown agent '$agent' (valid: $AGENT_SKILLS_VALID or all)" ;;
+    esac
+  done
+  unset IFS
+}
+
+register_agents() {
+  spec=$1
+  expand_agent_spec "$spec" || return 0
+  registered_agents=""
+  for agent in $expanded_agents; do
+    register_agent_skill "$agent"
+  done
+  printf '%s\n' "Agent skills registered:$registered_agents"
+  printf '%s\n' "Registration manifest: $agent_manifest_path"
+}
+
+unregister_agents() {
+  spec=$1
+  if [ "$spec" = "all" ]; then
+    agents=$(python3 - "$agent_manifest_path" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+if not os.path.exists(path):
+    print("")
+    raise SystemExit(0)
+with open(path, encoding="utf-8") as f:
+    payload = json.load(f)
+print(" ".join(sorted(payload.get("registered", {}).keys())))
+PY
+)
+    if [ -z "$agents" ]; then
+      printf '%s\n' "No registered agents in manifest; nothing to unregister."
+      return 0
+    fi
+    expanded_agents="$agents"
+  else
+    expand_agent_spec "$spec" || return 0
+  fi
+  for agent in $expanded_agents; do
+    unregister_agent_skill "$agent"
+  done
+  printf '%s\n' "Agent skills unregistered."
 }
 
 case "${1:-}" in
@@ -533,6 +817,23 @@ case "${1:-}" in
     [ "$#" -eq 1 ] || fail "--print-install-id accepts no additional arguments"
     detect_identity
     printf '%s\n' "$INSTALL_ID"
+    ;;
+  --agents=*)
+    spec=${1#--agents=}
+    [ "$#" -eq 1 ] || fail "--agents accepts no additional arguments"
+    install_skeleton
+    register_agents "$spec"
+    ;;
+  --register-agents=*)
+    spec=${1#--register-agents=}
+    [ "$#" -eq 1 ] || fail "--register-agents accepts no additional arguments"
+    require_active_install
+    register_agents "$spec"
+    ;;
+  --unregister-agents=*)
+    spec=${1#--unregister-agents=}
+    [ "$#" -eq 1 ] || fail "--unregister-agents accepts no additional arguments"
+    unregister_agents "$spec"
     ;;
   "")
     install_skeleton

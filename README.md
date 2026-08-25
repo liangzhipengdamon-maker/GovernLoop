@@ -35,9 +35,12 @@ icons present), with a system-auto token-free screenshot fallback on truncation.
 
 ## Choose your agent
 
-- **WorkBuddy** — best UX: install once, then use the `/governloop` slash command.
+- **WorkBuddy** — best UX: install once with `--agents=workbuddy`, then use the
+  `/governloop` slash command.
+- **Claude Code / Codex** — install once with `--agents=claude,codex`, then say
+  **"Use GovernLoop for this task"** in any project.
 - **OpenCode** — install the `skills/opencode/governloop/` skill.
-- **Claude Code / Codex / any local agent** — invoke the session manager CLI directly.
+- **Any local agent** — invoke the session manager CLI directly.
 - **DeepSeek Harness (DSH)** — install GovernLoop Core first, then the
   [GovernLoop-DSH](https://github.com/liangzhipengdamon-maker/GovernLoop-DSH) adapter.
 
@@ -46,8 +49,9 @@ icons present), with a system-auto token-free screenshot fallback on truncation.
 | Agent | Entry point |
 |---|---|
 | **WorkBuddy** | `/governloop` slash command (`skills/workbuddy/governloop/`) |
+| **Claude Code / Codex** | installed skill (description-triggered) |
 | **OpenCode** | skill (`skills/opencode/governloop/`) |
-| **Claude Code / Codex / any local agent** | session manager CLI or Neutral Relay directly |
+| **Any local agent** | session manager CLI or Neutral Relay directly |
 | **DeepSeek Harness** | via GovernLoop-DSH adapter |
 
 All agents share one session model: repo → task → session → conversation →
@@ -58,19 +62,26 @@ checkpoints → evidence → end. See `docs/AGENT_INTEGRATIONS.md`.
 Install once, then use it from any project:
 
 ```bash
-./scripts/install.sh                 # Phase 2B installer (runtime bundle + /governloop)
+./scripts/install.sh --agents=all     # Phase 2E installer: runtime bundle + agent skill activation
+cd <your-project>                     # then in your agent: "Use GovernLoop for this task"
+```
+
+WorkBuddy users instead use the slash command (after `--agents=workbuddy`):
+
+```bash
 cd <your-project> && /governloop     # new session + bind ChatGPT URL once
 /governloop status                   # optional
 /governloop end                      # FINAL_VERIFICATION + temp state cleanup
 ```
 
-Generic agents invoke the same session manager directly:
+Any generic agent invokes the same session manager via the installed stable
+entrypoint:
 
 ```bash
-python3 skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 skills/workbuddy/governloop/scripts/governloop_session.py bind https://chatgpt.com/c/<id>
-python3 skills/workbuddy/governloop/scripts/governloop_session.py checkpoint REVIEW_REQUIRED --message "..." --attach <evidence>
-python3 skills/workbuddy/governloop/scripts/governloop_session.py end
+~/.governloop/bin/governloop new
+~/.governloop/bin/governloop bind https://chatgpt.com/c/<id>
+~/.governloop/bin/governloop checkpoint REVIEW_REQUIRED --message "..." --attach <evidence>
+~/.governloop/bin/governloop end
 ```
 
 Prerequisites: Chrome running with CDP (`--remote-debugging-port=9233`) and an

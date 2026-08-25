@@ -4,6 +4,21 @@ You never need to invent a session id, a conversation routing config, or a
 per-project install. The `/governloop` skill detects your repository, derives a
 task from the branch / issue id, and creates a session for you.
 
+## Install & activate (Phase 2E)
+
+Install once, then use it from any project:
+
+```bash
+./scripts/install.sh --agents=all     # runtime bundle + register the skill into every detected agent
+```
+
+- **WorkBuddy** — the `/governloop` slash command is available in any project.
+- **Codex / Claude Code** — open the agent and type: **"Use GovernLoop for this task"**.
+
+Installed the agent later? Register without reinstalling:
+`./scripts/install.sh --register-agents=codex,claude,workbuddy` (remove with
+`--unregister-agents=all`). See `docs/AGENT_INTEGRATIONS.md` for the full table.
+
 ## The whole workflow
 
 ```text
@@ -59,14 +74,19 @@ cd <target-project>
 ## Not on WorkBuddy? (generic agent path)
 
 The same workflow is available to any agent (Claude Code, Codex, OpenCode, a
-plain script) by invoking the **same session manager** directly:
+plain script) by invoking the **same session manager** directly. After
+installation the stable entrypoint is `~/.governloop/bin/governloop` (running
+from the target project directory):
 
 ```bash
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py bind https://chatgpt.com/c/<conversation-id>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py checkpoint REVIEW_REQUIRED --message "..." --attach <evidence...>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py end
+~/.governloop/bin/governloop new
+~/.governloop/bin/governloop bind https://chatgpt.com/c/<conversation-id>
+~/.governloop/bin/governloop checkpoint REVIEW_REQUIRED --message "..." --attach <evidence...>
+~/.governloop/bin/governloop end
 ```
+
+(From a development checkout the equivalent invocation is
+`python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py …`.)
 
 Same session model, same rules: repo/task detection, auto session id, URL
 once per session, five checkpoints, evidence delivery, temp-state cleanup.

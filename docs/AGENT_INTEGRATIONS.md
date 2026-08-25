@@ -22,6 +22,36 @@ Rules that hold for **every** agent:
 - **Evidence delivery** follows one attachment policy (exists → relevant →
   secret scan → record; fail-closed on any refusal).
 
+## Install-time agent skill activation (Phase 2E)
+
+The installer can register the installed skill into an agent's skill directory
+so the agent is usable right after installation — no manual skill setup:
+
+```bash
+./scripts/install.sh --agents=all                    # install + auto-detect agents
+./scripts/install.sh --agents=codex,claude,workbuddy # install + explicit list
+./scripts/install.sh --register-agents=codex         # register later (no reinstall)
+./scripts/install.sh --unregister-agents=all         # remove registered skill links
+```
+
+| Agent | Registered skill link | Skill content |
+|---|---|---|
+| Codex | `~/.codex/skills/governloop` → installed universal skill | description-triggered: user says "Use GovernLoop for this task" |
+| Claude Code | `~/.claude/skills/governloop` → installed universal skill | description-triggered: user says "Use GovernLoop for this task" |
+| WorkBuddy | `~/.workbuddy/skills/governloop` → installed WorkBuddy flavor | `/governloop` slash command (first-class) |
+
+Registration is **opt-in** and writes only a symlink into the agent's skill
+directory (the link resolves into `~/.governloop/current/skills/...`, so it
+follows version upgrades automatically). It never overwrites an existing
+user-owned skill directory or a symlink it does not manage — conflicts fail
+closed. The registration manifest is written to
+`~/.governloop/metadata/agent-skills.json`. Agent skill roots can be redirected
+for tests/CI via `GOVERLOOP_CODEX_SKILLS_DIR`, `GOVERLOOP_CLAUDE_SKILLS_DIR`,
+`GOVERLOOP_WORKBUDDY_SKILLS_DIR`.
+
+Manual installation (the sections below) remains fully supported and
+equivalent — Phase 2E is a thin UX wrapper, not a different integration.
+
 ## WorkBuddy — `/governloop` slash command (fastest UX)
 
 The first-class command entrypoint. Install the skill into

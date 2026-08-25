@@ -7,8 +7,9 @@ description: >-
   and report review checkpoints (NEW_BLOCKER / UNEXPECTED_STATE /
   BEFORE_DESTRUCTIVE_ACTION / REVIEW_REQUIRED / FINAL_VERIFICATION) with evidence
   attachments to the bound conversation through the GovernLoop Neutral Relay.
-  Use when the user types /governloop (new|status|bind|end) or needs a GovernLoop
-  review session / checkpoint reporting / session routing for the current repo.
+  Use when the user types /governloop (new|status|bind|end), says
+  "Use GovernLoop for this task", or needs a GovernLoop review session /
+  checkpoint reporting / session routing for the current repo.
 agent_created: true
 ---
 

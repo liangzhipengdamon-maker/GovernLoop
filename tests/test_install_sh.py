@@ -34,6 +34,12 @@ class InstallerSkeletonTests(unittest.TestCase):
     RUNTIME_SOURCE_FILES = {
         "scripts/install.sh": INSTALLER_SOURCE,
         "skills/governloop/SKILL.md": REPO_ROOT / "skills/governloop/SKILL.md",
+        "skills/workbuddy/governloop/SKILL.md": (
+            REPO_ROOT / "skills/workbuddy/governloop/SKILL.md"
+        ),
+        "skills/workbuddy/governloop/QUICK_START.md": (
+            REPO_ROOT / "skills/workbuddy/governloop/QUICK_START.md"
+        ),
         "skills/workbuddy/governloop/scripts/governloop_session.py": (
             REPO_ROOT / "skills/workbuddy/governloop/scripts/governloop_session.py"
         ),
@@ -132,7 +138,7 @@ class InstallerSkeletonTests(unittest.TestCase):
         self.assertEqual(payload["source_commit"], self.source_sha(repo))
         self.assertEqual(payload["source_type"], "untagged_checkout")
         self.assertEqual(payload["source_ref"], "main")
-        self.assertEqual(payload["installer_version"], "phase2b-runtime-bundle-v1")
+        self.assertEqual(payload["installer_version"], "phase2e-agent-skill-activation-v1")
         self.assertRegex(payload["install_timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertEqual(os.readlink(home / "current"), f"versions/{install_id}")
         self.assertTrue((home / "bin").is_dir())
@@ -346,6 +352,10 @@ INSTALLED_BUNDLE_FILES = {
     "skills/governloop/contracts/neutral-relay-checkpoint-delivery.md",
     "skills/governloop/contracts/AGENT_SAFETY_CONTRACT.md",
     "skills/governloop/contracts/policy.md",
+    "skills/workbuddy/governloop/SKILL.md",
+    "skills/workbuddy/governloop/QUICK_START.md",
+    "skills/workbuddy/governloop/references/policy.md",
+    "skills/workbuddy/governloop/scripts/governloop_session.py",
     "bin/governloop",
 }
 
@@ -1029,6 +1039,293 @@ class Phase2CDiagnosticsTests(Phase2BRuntimeBundleTests):
         output = r.stdout + r.stderr
         self.assertIn("[FAIL]", output)
         self.assertIn("dangling", output)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2E: agent skill activation (post-install registration)
+# ---------------------------------------------------------------------------
+class Phase2EAgentSkillRegistrationTests(InstallerSkeletonTests):
+    """Phase 2E: --agents / --register-agents / --unregister-agents register
+    the installed skill into agent skill directories as thin UX wrappers."""
+
+    AGENT_ROOTS = {
+        "codex": "GOVERLOOP_CODEX_SKILLS_DIR",
+        "claude": "GOVERLOOP_CLAUDE_SKILLS_DIR",
+        "workbuddy": "GOVERLOOP_WORKBUDDY_SKILLS_DIR",
+    }
+
+    def installer_with_env(self, repo, home, extra_env, *args, check=True):
+        # A fake HOME keeps the default agent skill roots hermetic (the real
+        # ~/.codex, ~/.claude, ~/.workbuddy must never be touched by tests).
+        env = os.environ.copy()
+        env["HOME"] = str(self.root / "fake-home")
+        env["GOVERLOOP_HOME"] = str(home)
+        env.update(extra_env)
+        return subprocess.run(
+            ["sh", str(repo / "scripts" / "install.sh"), *args],
+            check=check, text=True, capture_output=True, env=env,
+        )
+
+    def fake_home(self):
+        return self.root / "fake-home"
+
+    def default_root(self, agent):
+        return self.fake_home() / f".{agent}" / "skills"
+
+    def agent_roots(self, prefix):
+        return {agent: self.root / f"{prefix}-{agent}" for agent in self.AGENT_ROOTS}
+
+    def root_env(self, roots):
+        return {var: str(roots[agent]) for agent, var in self.AGENT_ROOTS.items()}
+
+    def installed_version_dir(self, repo, home):
+        return home / "versions" / f"main.{self.source_short_sha(repo)}"
+
+    def test_default_install_registers_no_agent_skills(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        result = self.installer(repo, home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # No agent skill dirs are created outside GOVERLOOP_HOME by default.
+        for agent in self.AGENT_ROOTS:
+            self.assertFalse(self.default_root(agent).exists(), agent)
+        self.assertFalse((home / "metadata" / "agent-skills.json").exists())
+
+    def test_register_named_agents_creates_links(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        result = self.installer_with_env(
+            repo, home, self.root_env(roots), "--agents=codex,claude,workbuddy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        version_dir = self.installed_version_dir(repo, home)
+        expected = {
+            "codex": "skills/governloop",
+            "claude": "skills/governloop",
+            "workbuddy": "skills/workbuddy/governloop",
+        }
+        for agent, flavor in expected.items():
+            link = roots[agent] / "governloop"
+            self.assertTrue(link.is_symlink(), agent)
+            self.assertEqual(
+                os.path.realpath(link), os.path.realpath(version_dir / flavor), agent)
+            skill = (version_dir / flavor / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("Use GovernLoop for this task", skill, agent)
+        self.assertIn("Agent skills registered:", result.stdout)
+
+    def test_registration_manifest_records_entries(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        self.installer_with_env(
+            repo, home, self.root_env(roots), "--agents=codex,workbuddy")
+        manifest_path = home / "metadata" / "agent-skills.json"
+        self.assertTrue(manifest_path.is_file())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        registered = manifest["registered"]
+        self.assertEqual(sorted(registered.keys()), ["codex", "workbuddy"])
+        codex = registered["codex"]
+        self.assertEqual(codex["link"], str(roots["codex"] / "governloop"))
+        self.assertTrue(codex["target"].startswith(str(home / "current/skills/")))
+        self.assertRegex(codex["registered_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_unregister_agents_all_removes_links_and_manifest(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        self.installer_with_env(repo, home, env, "--agents=codex,claude")
+        result = self.installer_with_env(repo, home, env, "--unregister-agents=all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for agent in ("codex", "claude"):
+            self.assertFalse((roots[agent] / "governloop").exists(), agent)
+        self.assertFalse((home / "metadata" / "agent-skills.json").exists())
+
+    def test_unregister_agents_by_name(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        self.installer_with_env(repo, home, env, "--agents=codex,claude")
+        result = self.installer_with_env(repo, home, env, "--unregister-agents=codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((roots["codex"] / "governloop").exists())
+        self.assertTrue((roots["claude"] / "governloop").is_symlink())
+        manifest = json.loads(
+            (home / "metadata" / "agent-skills.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(manifest["registered"].keys()), ["claude"])
+
+    def test_register_conflicting_user_dir_fails_closed(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        # A user-owned real skill directory must never be overwritten.
+        user_skill = roots["codex"] / "governloop"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("user-owned\n", encoding="utf-8")
+        result = self.installer_with_env(repo, home, env, "--agents=codex", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to overwrite", result.stderr)
+        # The install itself committed; the user-owned dir is untouched.
+        self.assertEqual(
+            (user_skill / "SKILL.md").read_text(encoding="utf-8"), "user-owned\n")
+        self.assertEqual(
+            os.readlink(home / "current"),
+            f"versions/main.{self.source_short_sha(repo)}")
+
+    def test_register_conflicting_foreign_symlink_fails_closed(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        foreign = roots["claude"] / "governloop"
+        foreign.parent.mkdir(parents=True)
+        foreign.symlink_to("/some/other/target")
+        result = self.installer_with_env(repo, home, env, "--agents=claude", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to overwrite", result.stderr)
+        self.assertEqual(os.readlink(foreign), "/some/other/target")
+
+    def test_register_idempotent(self):
+        # The install itself is immutable (same INSTALL_ID is rejected on
+        # reinstall), so idempotency applies to re-registration into an
+        # existing active install via --register-agents.
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        self.installer(repo, home)
+        first = self.installer_with_env(repo, home, env, "--register-agents=codex")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.installer_with_env(repo, home, env, "--register-agents=codex")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        link = roots["codex"] / "governloop"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(
+            os.path.realpath(link),
+            os.path.realpath(home / "current" / "skills/governloop"))
+        self.assertTrue((home / "metadata" / "agent-skills.json").is_file())
+
+    def test_register_agents_all_detects_only_existing(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        # With the fake HOME only the codex root exists -> "all" registers
+        # codex only and creates nothing for the other agents.
+        self.default_root("codex").mkdir(parents=True)
+        result = self.installer_with_env(repo, home, {}, "--agents=all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.default_root("codex") / "governloop").is_symlink())
+        self.assertFalse((self.default_root("claude") / "governloop").exists())
+        self.assertFalse((self.default_root("workbuddy") / "governloop").exists())
+
+    def test_register_agents_all_with_override_env(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        # Override env counts as "detected" for "all" (hermetic CI pattern).
+        result = self.installer_with_env(
+            repo, home, self.root_env(roots), "--agents=all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for agent in self.AGENT_ROOTS:
+            self.assertTrue((roots[agent] / "governloop").is_symlink(), agent)
+
+    def test_register_agents_standalone_mode(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        roots = self.agent_roots("root")
+        result = self.installer_with_env(
+            repo, home, self.root_env(roots), "--register-agents=codex,claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((roots["codex"] / "governloop").is_symlink())
+        self.assertTrue((roots["claude"] / "governloop").is_symlink())
+
+    def test_register_agents_standalone_requires_active_install(self):
+        repo = self.make_source_repo()
+        home = self.root / "fresh-home"
+        roots = self.agent_roots("root")
+        result = self.installer_with_env(
+            repo, home, self.root_env(roots), "--register-agents=codex", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no active installation", result.stderr)
+
+    def test_unknown_agent_rejected(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        result = self.installer_with_env(repo, home, {}, "--agents=emacs", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown agent", result.stderr)
+
+    def test_registered_skill_independent_of_source_checkout(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        roots = self.agent_roots("root")
+        env = self.root_env(roots)
+        self.installer_with_env(repo, home, env, "--agents=codex,workbuddy")
+        shutil.rmtree(repo)
+        for agent in ("codex", "workbuddy"):
+            link = roots[agent] / "governloop"
+            self.assertTrue(link.is_symlink(), agent)
+            skill = (link / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("Use GovernLoop for this task", skill, agent)
+        # WorkBuddy flavor keeps its slash-command binding + bundled script.
+        wb = roots["workbuddy"] / "governloop"
+        self.assertTrue((wb / "scripts/governloop_session.py").is_file())
+        self.assertTrue((wb / "references/policy.md").is_file())
+        self.assertTrue((wb / "QUICK_START.md").is_file())
+
+    def test_workbuddy_flavor_checkout_independent_no_leakage(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = self.installed_version_dir(repo, home)
+        flavor = version_dir / "skills/workbuddy/governloop"
+        wb_skill = (flavor / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("~/.governloop/current/runtime/neutral_relay.py", wb_skill)
+        for forbidden in ("docs/", "tools/", "skills/workbuddy", "README.md"):
+            self.assertNotIn(forbidden, wb_skill)
+        policy = (flavor / "references/policy.md").read_text(encoding="utf-8")
+        self.assertIn("~/.governloop/current/runtime/neutral_relay.py", policy)
+        for forbidden in ("docs/", "tools/", "README.md"):
+            self.assertNotIn(forbidden, policy)
+        for p in flavor.rglob("*"):
+            if p.is_file():
+                self.assertNotIn(
+                    str(repo), p.read_text(encoding="utf-8", errors="replace"), str(p))
+
+    def test_workbuddy_flavor_refs_resolve(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = self.installed_version_dir(repo, home)
+        flavor = version_dir / "skills/workbuddy/governloop"
+        skill = (flavor / "SKILL.md").read_text(encoding="utf-8")
+        unresolved = []
+        for m in re.finditer(r"`([^`\n]+)`", skill):
+            ref = m.group(1).strip()
+            if "<" in ref or ">" in ref:
+                continue  # template placeholder
+            if ref.endswith("config.json"):
+                continue  # runtime routing config path, not a bundle artifact
+            if ref.startswith("~"):
+                mapped = ref.replace("~/.governloop", str(home), 1)
+                if not Path(os.path.expanduser(mapped)).exists():
+                    unresolved.append(ref)
+                continue
+            if ref.startswith(("references/", "scripts/", "QUICK_START")):
+                if not (flavor / ref).exists():
+                    unresolved.append(ref)
+        self.assertEqual(unresolved, [], f"unresolved workbuddy flavor refs: {unresolved}")
+
+    def test_universal_skill_trigger_phrase_present(self):
+        repo = self.make_source_repo()
+        home = self.root / "home"
+        self.installer(repo, home)
+        version_dir = self.installed_version_dir(repo, home)
+        skill = (version_dir / "skills/governloop/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Use GovernLoop for this task", skill)
+        self.assertIn("Agent skill activation", skill)
 
 
 if __name__ == "__main__":
