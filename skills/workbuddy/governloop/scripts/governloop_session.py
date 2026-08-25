@@ -488,10 +488,16 @@ def run_checkpoint(
             f"ATTACHMENTS: 0 delivered ({inline_count} inlined into message text "
             f"-- relay has no --attachment support)"
         )
+    # Full readback is part of the stable CLI boundary. The relay keeps the
+    # canonical response file as internal evidence, but agents must not need to
+    # open that temp file (which may cross their sandbox boundary) just to read
+    # the assistant reply. Emit the complete response on stdout instead.
     summary = (
         f"CHECKPOINT: {ctype}\nSESSION: {state['session_id']}\n"
         f"TEXT_RELAY: PASS\n{attrs_note}\n"
-        f"RESPONSE (head): {response[:400]!r}"
+        "RESPONSE_BEGIN\n"
+        f"{response}"
+        "\nRESPONSE_END"
     )
     return True, summary, 0
 

@@ -67,6 +67,15 @@ The second form is used by ChatGPT Project/custom-GPT conversation pages. Keep
 the full URL intact; do not rewrite it to `/c/<id>` before binding. If the CLI
 rejects a URL, surface its actual error instead of inventing an older workaround.
 
+## Checkpoint response readback
+
+Treat the `governloop checkpoint` command's stdout as the normal readback
+boundary. On success it prints the complete assistant reply between
+`RESPONSE_BEGIN` and `RESPONSE_END`. Consume that text directly. Do **not** open
+`/tmp/governloop-response-*` or other GovernLoop temp files merely to obtain the
+reply; those files are internal evidence/state and may cross the agent sandbox
+boundary.
+
 ## Install / upgrade reload rule
 
 If installation or upgrade output includes `AGENT_RELOAD_REQUIRED`, do not
