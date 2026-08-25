@@ -17,6 +17,8 @@ jobs:
         run: python3 -m pip install websockets
       - name: Relay + session-manager tests
         run: python3 -m unittest discover -s tools/neutral-relay/tests
+      - name: ChatGPT Project conversation URL tests
+        run: python3 -m unittest tests.test_chatgpt_project_conversation_url
 
   installer-tests:
     runs-on: ubuntu-latest
