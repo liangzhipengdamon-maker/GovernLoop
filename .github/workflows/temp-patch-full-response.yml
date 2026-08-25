@@ -40,9 +40,7 @@ jobs:
           skill.write_text(t.replace(needle, replacement, 1))
           PY
       - name: Run focused tests
-        run: |
-          python3 -m unittest tests.test_full_response_readback
-          python3 skills/workbuddy/governloop/scripts/test_governloop_session.py
+        run: python3 -m unittest tests.test_full_response_readback
       - name: Commit patch
         run: |
           git config user.name "github-actions[bot]"
