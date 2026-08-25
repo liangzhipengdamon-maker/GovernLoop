@@ -1,8 +1,8 @@
 # QUICK START — Install once, use the skill
 
 GovernLoop is agent-agnostic. Install the Core runtime once, expose the same
-universal GovernLoop skill to the coding agents you use, then work from the
-agent normally.
+universal GovernLoop skill to the coding agents you use, restart/reload those
+agents once so they load the installed skill, then work from the agent normally.
 
 ## 1. Install GovernLoop
 
@@ -58,9 +58,26 @@ DSH instead:
 dsh plugin --profile <name> add governloop-dsh@0.1.1
 ```
 
-## 2. Open your coding agent
+## 2. Restart/reload the selected coding agent once
 
-Open any project in the selected agent and ask it to use GovernLoop:
+After a first install **or an upgrade**, restart/reload WorkBuddy, OpenCode,
+Claude Code, or Codex before using GovernLoop. A coding-agent session that
+performed the install may still have the previous skill cached in memory even
+though the new files are already on disk.
+
+The installer prints this explicitly as:
+
+```text
+AGENT_RELOAD_REQUIRED
+Restart or reload each selected coding agent before using GovernLoop.
+```
+
+Do not continue GovernLoop setup in the same agent session that performed the
+install or upgrade.
+
+## 3. Open your project and use GovernLoop
+
+After the reload, open any project in the selected agent and say:
 
 ```text
 Use GovernLoop for this task.
@@ -69,11 +86,22 @@ Use GovernLoop for this task.
 The skill uses the installed `governloop` CLI underneath. Normal users do not
 need to invoke the session manager or Neutral Relay by path.
 
-## 3. Bind the ChatGPT conversation when asked
+## 4. Bind the ChatGPT conversation when asked
 
 A new session starts without inheriting another project's conversation. When
-GovernLoop asks for a reviewer conversation, provide the ChatGPT URL for this
-session only.
+GovernLoop asks for a reviewer conversation, provide the exact ChatGPT
+conversation URL shown in the browser address bar.
+
+Supported common forms include both ordinary conversations and ChatGPT
+Project/custom-GPT conversations:
+
+```text
+https://chatgpt.com/c/<conversation-id>
+https://chatgpt.com/g/<project-or-gpt-id>/c/<conversation-id>
+```
+
+Do not manually rewrite the Project/custom-GPT URL. The skill passes the exact
+URL to the currently installed Core and treats the CLI result as runtime truth.
 
 That URL is temporary session state. It is not written to permanent canonical
 configuration and is not reused by an unrelated session.
@@ -120,4 +148,5 @@ The stable installed execution interface is:
 
 The skill uses it for `new`, `bind`, `checkpoint`, `status`, `end`, and `doctor`.
 You can invoke it directly for diagnostics or automation, but the primary user
-experience is skill-first: install once, open the agent, use GovernLoop.
+experience is skill-first: install once, reload the agent once, open the project,
+use GovernLoop.
