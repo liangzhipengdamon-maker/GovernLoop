@@ -41,6 +41,22 @@ class TestRelayAdapter(unittest.TestCase):
             status = json.load(f)
         self.assertEqual(status["state"], "WAITING_FOR_REVIEW")
 
+    def test_no_default_bridge_dir_fails_fast(self):
+        # The legacy '.agent-bridge' default was removed (chore/remove-agent-
+        # bridge): without AGENT_BRIDGE_DIR the adapter must fail fast instead
+        # of silently using a dangling default path.
+        saved = os.environ.pop("AGENT_BRIDGE_DIR", None)
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                relay_adapter.get_bridge_dir()
+            self.assertIn("AGENT_BRIDGE_DIR is required", str(ctx.exception))
+            # The file getters propagate the same fail-fast.
+            with self.assertRaises(RuntimeError):
+                relay_adapter.get_status_file()
+        finally:
+            if saved is not None:
+                os.environ["AGENT_BRIDGE_DIR"] = saved
+
     def test_gpt_review_triple_head_match_pass(self):
         relay_adapter.handle_review_request()
         

@@ -5,7 +5,18 @@ import argparse
 import uuid
 
 def get_bridge_dir():
-    return os.environ.get("AGENT_BRIDGE_DIR", ".agent-bridge")
+    # The legacy AgentOps bridge default ('.agent-bridge') was removed with the
+    # retired protocol (see chore/remove-agent-bridge). There is deliberately no
+    # fallback path: callers must pass an explicit bridge directory via
+    # AGENT_BRIDGE_DIR, or this adapter fails fast instead of silently dangling.
+    bridge_dir = os.environ.get("AGENT_BRIDGE_DIR")
+    if not bridge_dir:
+        raise RuntimeError(
+            "AGENT_BRIDGE_DIR is required: this legacy AgentOps bridge adapter "
+            "has no default bridge directory (the '.agent-bridge' default was "
+            "removed). Set AGENT_BRIDGE_DIR to an explicit directory."
+        )
+    return bridge_dir
 
 def get_status_file():
     return os.path.join(get_bridge_dir(), "status.json")
