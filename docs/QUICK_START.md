@@ -1,128 +1,123 @@
-# QUICK_START — GovernLoop in 3 commands
+# QUICK START — Install once, use the skill
 
-You never need to invent a session id, a conversation routing config, or a
-per-project install. The `/governloop` skill detects your repository, derives a
-task from the branch / issue id, and creates a session for you.
+GovernLoop is agent-agnostic. Install the Core runtime once, expose the same
+universal GovernLoop skill to the coding agents you use, then work from the
+agent normally.
 
-## The whole workflow
-
-```text
-cd <target-project>
-
-/governloop          # creates/resumes a session, asks for the ChatGPT URL once if missing
-                     # ... work normally (agent reports checkpoints automatically) ...
-/governloop status   # optional: see repo/task/session/URL/last-checkpoint
-/governloop end      # task done: optional FINAL_VERIFICATION + temp state cleanup
-```
-
-## What `/governloop` does for you
-
-1. **Detects the current git repo** (from `remote.origin.url`, e.g. `owner/repo`).
-2. **Derives the task** (priority: Linear/GitHub issue id in context → current
-   branch → explicit title → generated slug).
-3. **Generates the session id** `<PROJECT>-<TASK>-<YYYY-MM-DD>` — you never
-   type one.
-4. **Asks for the ChatGPT conversation URL once** if the session has none yet:
-
-   ```text
-   USER_CONVERSATION_SELECTION_REQUIRED
-   ```
-
-   Reply with the URL you want to use **for this session only**:
-
-   ```text
-   /governloop bind https://chatgpt.com/c/6a82b993-f1e0-83ec-9cba-b77ec91e572f
-   ```
-
-5. **Work normally.** At the five review checkpoints the agent automatically
-   reports a concise summary + supporting evidence files to that conversation:
-
-   | Checkpoint | When it fires |
-   |---|---|
-   | `NEW_BLOCKER` | a new blocker is discovered |
-   | `UNEXPECTED_STATE` | state differs from what was expected |
-   | `BEFORE_DESTRUCTIVE_ACTION` | right before any destructive/mutating action |
-   | `REVIEW_REQUIRED` | a decision or review is needed from the reviewer |
-   | `FINAL_VERIFICATION` | end of task final verification |
-
-   Ordinary progress is **not** sent (avoid noise).
-
-6. When done:
-
-   ```text
-   /governloop end
-   ```
-
-   The temp session state is removed; nothing is ever written to the permanent
-   GovernLoop config.
-
-## Not on WorkBuddy? (generic agent path)
-
-The same workflow is available to any agent (Claude Code, Codex, OpenCode, a
-plain script) by invoking the **same session manager** directly:
+## 1. Install GovernLoop
 
 ```bash
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py bind https://chatgpt.com/c/<conversation-id>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py checkpoint REVIEW_REQUIRED --message "..." --attach <evidence...>
-python3 <repo>/skills/workbuddy/governloop/scripts/governloop_session.py end
+git clone https://github.com/liangzhipengdamon-maker/GovernLoop.git
+cd GovernLoop
+sh install.sh
 ```
 
-Same session model, same rules: repo/task detection, auto session id, URL
-once per session, five checkpoints, evidence delivery, temp-state cleanup.
-There is no per-agent config — only per-session temporary state. Per-agent
-setup notes: `docs/AGENT_INTEGRATIONS.md`.
+The installer performs two layers in order:
 
-## FAQ (the 8 questions)
+1. installs the checkout-independent GovernLoop Core runtime under
+   `~/.governloop/`;
+2. asks which coding agents you use and exposes the same installed universal
+   skill through their native user skill directories.
 
-**1. How do I use it in a different project?**
-Just `cd <other-project>` and run `/governloop` again. Everything is derived
-from that repo; nothing from the previous project leaks in.
-
-**2. Do I need to reinstall GovernLoop per project?**
-**No.** GovernLoop is shared infrastructure installed once. Each project only
-gets its own *session state*.
-
-**3. Do I have to find a SESSION ID myself?**
-**No.** The session id `<PROJECT>-<TASK>-<YYYY-MM-DD>` is generated
-automatically. You never type or look one up.
-
-**4. Do I enter the ChatGPT URL every time?**
-**Once per session.** Within the same session every checkpoint reuses it. A new
-session (new task or new project) asks once again.
-
-**5. Will a new project inherit the old conversation?**
-**No.** Conversation URLs are task/session-level state, never project-level.
-A new session in a different repo starts unbounded (no inherited URL).
-
-**6. When does the agent automatically report to GPT?**
-Only at the five checkpoints: `NEW_BLOCKER`, `UNEXPECTED_STATE`,
-`BEFORE_DESTRUCTIVE_ACTION`, `REVIEW_REQUIRED`, `FINAL_VERIFICATION`.
-
-**7. Are evidence files sent automatically?**
-Yes — for required checkpoints the agent attaches the relevant, secret-scanned
-evidence files per the attachment policy. A local path typed in the text does
-**not** count as delivery. If the relay does not support attachments, the file
-content is inlined into the message and the delivery status says so honestly.
-
-**8. What happens when the session ends?**
-`/governloop end` sends `FINAL_VERIFICATION` (optional, `--final`) and removes
-the temp session state. The canonical routing config is never modified.
-
-## Status
+Interactive selection:
 
 ```text
-/governloop status
+Which agents do you use?
+  1) WorkBuddy
+  2) OpenCode
+  3) Claude Code
+  4) Codex
+  5) DeepSeek Harness
 ```
 
-Shows: repo · task · session id · conversation bound (yes/no) · last checkpoint
-· temp state path.
+For automation or a non-interactive install, the agent selection can be supplied
+explicitly:
 
-## Rules of thumb
+```bash
+GOVERLOOP_INSTALL_AGENTS=workbuddy,codex sh install.sh
+```
 
-- One URL per session, provided once; reused for every checkpoint in that
-  session; never persisted to the canonical config.
-- A new session in a different repo never inherits the previous session's URL.
-- A local path typed in a checkpoint message is not delivery — evidence files
-  are attached as real attachments (secret-scanned first), or inlined with an
-  explicit degradation note when the relay lacks attachment support.
+Supported skill destinations:
+
+| Agent | Native user skill path |
+|---|---|
+| WorkBuddy | `~/.workbuddy/skills/governloop` |
+| OpenCode | `~/.config/opencode/skills/governloop` |
+| Claude Code | `~/.claude/skills/governloop` |
+| Codex | `~/.codex/skills/governloop` |
+
+Each destination points to the same installed skill at
+`~/.governloop/current/skills/governloop`. The installer refuses to overwrite an
+existing user-owned skill.
+
+DeepSeek Harness is different: DSH already provides a native plugin mechanism,
+so GovernLoop does not copy a generic skill into DSH. Install the adapter through
+DSH instead:
+
+```bash
+dsh plugin --profile <name> add governloop-dsh@0.1.1
+```
+
+## 2. Open your coding agent
+
+Open any project in the selected agent and ask it to use GovernLoop:
+
+```text
+Use GovernLoop for this task.
+```
+
+The skill uses the installed `governloop` CLI underneath. Normal users do not
+need to invoke the session manager or Neutral Relay by path.
+
+## 3. Bind the ChatGPT conversation when asked
+
+A new session starts without inheriting another project's conversation. When
+GovernLoop asks for a reviewer conversation, provide the ChatGPT URL for this
+session only.
+
+That URL is temporary session state. It is not written to permanent canonical
+configuration and is not reused by an unrelated session.
+
+## Runtime prerequisites
+
+GovernLoop expects:
+
+- Chrome running with CDP, normally `--remote-debugging-port=9233`;
+- an already logged-in ChatGPT Web session;
+- the target ChatGPT conversation open and available for binding.
+
+GovernLoop does not own Chrome startup or browser credentials.
+
+## What the skill does
+
+The universal skill drives one shared lifecycle:
+
+```text
+repo → task → session → conversation → checkpoints → evidence → end
+```
+
+It detects the repository/task, creates or resumes the session, binds the
+conversation once when needed, reports the five review checkpoints, and cleans
+up temporary session state at the end.
+
+The five checkpoints are:
+
+- `NEW_BLOCKER`
+- `UNEXPECTED_STATE`
+- `BEFORE_DESTRUCTIVE_ACTION`
+- `REVIEW_REQUIRED`
+- `FINAL_VERIFICATION`
+
+Ordinary progress is not sent.
+
+## CLI (diagnostics / automation)
+
+The stable installed execution interface is:
+
+```text
+~/.governloop/bin/governloop
+```
+
+The skill uses it for `new`, `bind`, `checkpoint`, `status`, `end`, and `doctor`.
+You can invoke it directly for diagnostics or automation, but the primary user
+experience is skill-first: install once, open the agent, use GovernLoop.

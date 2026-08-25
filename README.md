@@ -33,49 +33,77 @@ delivery. Delivery is confirmed by request-correlated read-back; reply
 completion is gated on the ChatGPT completion UI (stop button gone + copy/rate
 icons present), with a system-auto token-free screenshot fallback on truncation.
 
-## Choose your agent
+## Quick Start
 
-- **WorkBuddy** — best UX: install once, then use the `/governloop` slash command.
-- **OpenCode** — install the `skills/opencode/governloop/` skill.
-- **Claude Code / Codex / any local agent** — invoke the session manager CLI directly.
-- **DeepSeek Harness (DSH)** — install GovernLoop Core first, then the
-  [GovernLoop-DSH](https://github.com/liangzhipengdamon-maker/GovernLoop-DSH) adapter.
+Install GovernLoop Core and expose the same universal GovernLoop skill to the
+coding agents you use:
 
-## Works with
+```bash
+git clone https://github.com/liangzhipengdamon-maker/GovernLoop.git
+cd GovernLoop
+sh install.sh
+```
 
-| Agent | Entry point |
+The installer first installs the checkout-independent Core runtime under
+`~/.governloop/`, then asks which agents you use:
+
+```text
+Which agents do you use?
+  1) WorkBuddy
+  2) OpenCode
+  3) Claude Code
+  4) Codex
+  5) DeepSeek Harness
+```
+
+For WorkBuddy, OpenCode, Claude Code, and Codex, the installer exposes the
+**same installed universal skill** through the agent's native user skill
+directory. It does not create per-agent protocol forks and it refuses to
+overwrite an existing user-owned skill.
+
+DeepSeek Harness uses its native plugin mechanism instead of a copied generic
+skill. The installer prints the adapter command:
+
+```bash
+dsh plugin --profile <name> add governloop-dsh@0.1.1
+```
+
+After installation, open your coding project in the agent and ask it to use
+GovernLoop, for example:
+
+```text
+Use GovernLoop for this task.
+```
+
+The skill drives the installed `governloop` CLI internally. Normal users do not
+need to manage session-manager or Neutral Relay paths manually.
+
+Prerequisites: Chrome running with CDP (`--remote-debugging-port=9233`) and an
+open ChatGPT conversation. The first session asks for the ChatGPT conversation
+URL when required; that binding remains temporary session state.
+
+## Agent integrations
+
+| Agent | User-facing entry point |
 |---|---|
-| **WorkBuddy** | `/governloop` slash command (`skills/workbuddy/governloop/`) |
-| **OpenCode** | skill (`skills/opencode/governloop/`) |
-| **Claude Code / Codex / any local agent** | session manager CLI or Neutral Relay directly |
-| **DeepSeek Harness** | via GovernLoop-DSH adapter |
+| **WorkBuddy** | GovernLoop skill / `/governloop` |
+| **OpenCode** | GovernLoop skill |
+| **Claude Code** | GovernLoop skill |
+| **Codex** | GovernLoop skill |
+| **DeepSeek Harness** | GovernLoop-DSH native adapter |
 
 All agents share one session model: repo → task → session → conversation →
 checkpoints → evidence → end. See `docs/AGENT_INTEGRATIONS.md`.
 
-## Quick Start
+## CLI (under the skill)
 
-Install once, then use it from any project:
+The stable installed execution interface is `~/.governloop/bin/governloop`.
+Skills and agents use it for `new`, `bind`, `checkpoint`, `status`, `end`, and
+`doctor`. It remains available for diagnostics and automation, but it is not the
+primary day-to-day user interface.
 
-```bash
-./scripts/install.sh                 # Phase 2B installer (runtime bundle + /governloop)
-cd <your-project> && /governloop     # new session + bind ChatGPT URL once
-/governloop status                   # optional
-/governloop end                      # FINAL_VERIFICATION + temp state cleanup
-```
-
-Generic agents invoke the same session manager directly:
-
-```bash
-python3 skills/workbuddy/governloop/scripts/governloop_session.py new
-python3 skills/workbuddy/governloop/scripts/governloop_session.py bind https://chatgpt.com/c/<id>
-python3 skills/workbuddy/governloop/scripts/governloop_session.py checkpoint REVIEW_REQUIRED --message "..." --attach <evidence>
-python3 skills/workbuddy/governloop/scripts/governloop_session.py end
-```
-
-Prerequisites: Chrome running with CDP (`--remote-debugging-port=9233`) and an
-open ChatGPT conversation. Guides: `docs/QUICK_START.md` (3 commands + FAQ),
-`docs/USAGE.md` (full reference), `docs/MULTI_PROJECT_WORKFLOW.md`.
+Guides: `docs/QUICK_START.md`, `docs/USAGE.md`,
+`docs/MULTI_PROJECT_WORKFLOW.md`.
 
 ## Neutral Relay
 
@@ -90,7 +118,8 @@ and writes the complete assistant response. Full contract:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tools/neutral-relay/tests   # relay + session-manager suite
+python3 -m unittest discover -s tools/neutral-relay/tests
+python3 -m unittest tests.test_install_agent_skills
 ```
 
 ## License
