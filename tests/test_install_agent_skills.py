@@ -56,13 +56,17 @@ class AgentSkillInstallerTests(unittest.TestCase):
         self.assert_link(self.home / ".config" / "opencode" / "skills" / "governloop")
         self.assert_link(self.home / ".claude" / "skills" / "governloop")
         self.assert_link(self.home / ".codex" / "skills" / "governloop")
+        self.assertIn("AGENT_RELOAD_REQUIRED", result.stdout)
+        self.assertIn("Restart or reload each selected coding agent", result.stdout)
+        self.assertIn("same agent session", result.stdout)
 
-    def test_existing_matching_link_is_idempotent(self):
+    def test_existing_matching_link_is_idempotent_and_still_requires_reload(self):
         first = self.run_installer("--agents", "codex")
         second = self.run_installer("--agents", "codex")
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("already linked", second.stdout)
+        self.assertIn("AGENT_RELOAD_REQUIRED", second.stdout)
 
     def test_refuses_to_overwrite_existing_user_owned_skill(self):
         destination = self.home / ".claude" / "skills" / "governloop"
@@ -81,6 +85,7 @@ class AgentSkillInstallerTests(unittest.TestCase):
         self.assertIn(
             "dsh plugin --profile <name> add governloop-dsh@0.1.1", result.stdout
         )
+        self.assertNotIn("AGENT_RELOAD_REQUIRED", result.stdout)
         self.assertFalse((self.home / ".dsh" / "skills" / "governloop").exists())
 
     def test_noninteractive_without_selection_skips_cleanly(self):
@@ -94,6 +99,7 @@ class AgentSkillInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_link(self.home / ".workbuddy" / "skills" / "governloop")
         self.assert_link(self.home / ".codex" / "skills" / "governloop")
+        self.assertIn("AGENT_RELOAD_REQUIRED", result.stdout)
 
 
 if __name__ == "__main__":

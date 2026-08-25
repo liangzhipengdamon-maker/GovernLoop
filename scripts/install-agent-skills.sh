@@ -29,9 +29,19 @@ EOF
 [ -d "$UNIVERSAL_SKILL" ] || fail "installed universal skill not found: $UNIVERSAL_SKILL"
 [ -f "$UNIVERSAL_SKILL/SKILL.md" ] || fail "installed universal skill is incomplete: $UNIVERSAL_SKILL/SKILL.md"
 
+skill_agents_installed=""
+
+record_reload_agent() {
+  case " $skill_agents_installed " in
+    *" $1 "*) ;;
+    *) skill_agents_installed="$skill_agents_installed $1" ;;
+  esac
+}
+
 install_skill_link() {
   agent=$1
-  destination=$2
+  agent_key=$2
+  destination=$3
   parent=$(dirname "$destination")
 
   mkdir -p "$parent"
@@ -40,6 +50,7 @@ install_skill_link() {
     current_target=$(readlink "$destination")
     if [ "$current_target" = "$UNIVERSAL_SKILL" ]; then
       printf '%s\n' "[$agent] already linked: $destination"
+      record_reload_agent "$agent_key"
       return 0
     fi
     fail "$agent skill path already exists as a different symlink: $destination"
@@ -51,21 +62,22 @@ install_skill_link() {
 
   ln -s "$UNIVERSAL_SKILL" "$destination"
   printf '%s\n' "[$agent] installed: $destination -> $UNIVERSAL_SKILL"
+  record_reload_agent "$agent_key"
 }
 
 install_agent() {
   case "$1" in
     workbuddy)
-      install_skill_link "WorkBuddy" "${WORKBUDDY_HOME:-$HOME/.workbuddy}/skills/governloop"
+      install_skill_link "WorkBuddy" "workbuddy" "${WORKBUDDY_HOME:-$HOME/.workbuddy}/skills/governloop"
       ;;
     opencode)
-      install_skill_link "OpenCode" "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/governloop"
+      install_skill_link "OpenCode" "opencode" "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/governloop"
       ;;
     claude)
-      install_skill_link "Claude Code" "${CLAUDE_HOME:-$HOME/.claude}/skills/governloop"
+      install_skill_link "Claude Code" "claude" "${CLAUDE_HOME:-$HOME/.claude}/skills/governloop"
       ;;
     codex)
-      install_skill_link "Codex" "${CODEX_HOME:-$HOME/.codex}/skills/governloop"
+      install_skill_link "Codex" "codex" "${CODEX_HOME:-$HOME/.codex}/skills/governloop"
       ;;
     dsh)
       # DSH provides its own native plugin mechanism. Native-first: do not copy a
@@ -146,4 +158,11 @@ for raw in $agents; do
   install_agent "$agent"
 done
 
-printf '%s\n' "Agent integration complete. Open your coding agent and use the GovernLoop skill."
+printf '%s\n' "Agent integration complete."
+
+if [ -n "$(printf '%s' "$skill_agents_installed" | tr -d '[:space:]')" ]; then
+  printf '%s\n' "AGENT_RELOAD_REQUIRED"
+  printf '%s\n' "Restart or reload each selected coding agent before using GovernLoop."
+  printf '%s\n' "Do not continue GovernLoop setup in the same agent session that performed this install or upgrade: it may still have an older skill cached."
+  printf '%s\n' "After restarting, open your project and say: Use GovernLoop for this task."
+fi

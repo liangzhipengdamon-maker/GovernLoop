@@ -61,6 +61,11 @@ For WorkBuddy, OpenCode, Claude Code, and Codex, the installer exposes the
 directory. It does not create per-agent protocol forks and it refuses to
 overwrite an existing user-owned skill.
 
+**After a first install or any upgrade, restart/reload the selected coding agent
+once before using GovernLoop.** A session that performed the install may still
+have an older skill cached. The installer prints `AGENT_RELOAD_REQUIRED` when
+this applies; do not continue GovernLoop setup in that same agent session.
+
 DeepSeek Harness uses its native plugin mechanism instead of a copied generic
 skill. The installer prints the adapter command:
 
@@ -68,8 +73,8 @@ skill. The installer prints the adapter command:
 dsh plugin --profile <name> add governloop-dsh@0.1.1
 ```
 
-After installation, open your coding project in the agent and ask it to use
-GovernLoop, for example:
+After restarting/reloading the selected agent, open your coding project and ask
+it to use GovernLoop:
 
 ```text
 Use GovernLoop for this task.
@@ -79,8 +84,17 @@ The skill drives the installed `governloop` CLI internally. Normal users do not
 need to manage session-manager or Neutral Relay paths manually.
 
 Prerequisites: Chrome running with CDP (`--remote-debugging-port=9233`) and an
-open ChatGPT conversation. The first session asks for the ChatGPT conversation
-URL when required; that binding remains temporary session state.
+open ChatGPT conversation. The first session asks for the exact ChatGPT
+conversation URL when required. Common supported forms include:
+
+```text
+https://chatgpt.com/c/<conversation-id>
+https://chatgpt.com/g/<project-or-gpt-id>/c/<conversation-id>
+```
+
+The Project/custom-GPT URL should be passed as-is; the skill must not rewrite or
+pre-reject it based on cached instructions. Conversation binding remains
+temporary session state.
 
 ## Agent integrations
 
