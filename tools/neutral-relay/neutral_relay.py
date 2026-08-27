@@ -386,6 +386,380 @@ class SendConfirmation:
         return False, False, False, user_now, assistant_now
 
 
+# ── Chat composer targeting (two-phase safety model) ─────────────────────────
+# Phase A (pre-mutation): enumerate editable surfaces and select the single
+# trustworthy chat composer. A send control need NOT exist yet — newer ChatGPT
+# renders the send button only after text is present, so Phase A never depends
+# on it. Inject only into the selected node, verify the payload landed, and ROLL
+# BACK to the pre-mutation content on verification failure (no orphan draft).
+# Phase B (pre-send): after injection, re-enumerate and PROVE the resolved
+# composer is STILL the same one that received the checkpoint, then locate the
+# send control bound to that same composer container/form (excludes voice /
+# dictation controls, must be enabled). Any identity drift, disappearance,
+# reorder ambiguity, absent send, or voice-only control -> ROLL BACK the
+# checkpoint and fail closed (NO click, no complex auto-recovery).
+# Strict fail-closed: 0 or >1 trustworthy candidates -> zero mutation.
+
+# Enumerate every editable surface and report, for each, a stable unique CSS
+# selector (node_css), whether it is a writing-block/editor (excluded), and the
+# send control (send_css) bound to its nearest container/form. Editables that
+# share one composer-like FORM (e.g. ChatGPT's hidden fallback textarea + the
+# visible ProseMirror in the same <form class="group/composer">) are collapsed
+# to a single surface so the same composer is never seen as two candidates.
+ENUMERATE_SURFACES_JS = r"""
+(() => {
+  function cssPath(el) {
+    if (!el) return null;
+    if (el.id) return '#' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id);
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node.tagName.toLowerCase() !== 'body') {
+      let sel = node.tagName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const keep = Array.from(node.classList).filter(c => /[a-z]/i.test(c)).slice(0, 2);
+        sel += keep.map(c => '.' + (window.CSS && CSS.escape ? CSS.escape(c) : c)).join('');
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const sibs = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (sibs.length > 1) sel += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')';
+      }
+      parts.unshift(sel);
+      node = parent;
+    }
+    return parts.join(' > ');
+  }
+  function inWritingBlock(el) {
+    // ProseMirror is an editor technology, NOT proof of a writing-block, so it
+    // is never used as identity. writing-block/editor markers must be LOCAL to
+    // the container that also holds this editable: the container node itself is
+    // a writing-block, or a marker (writing-block-header / magic-edit) is a
+    // DIRECT child of a container on this editable's ancestor chain. Deep
+    // descendants under a shared high-level ancestor are deliberately ignored,
+    // so an unrelated sibling writing-block cannot contaminate classification.
+    // Genuinely ambiguous identity -> treated as writing-block (fail closed).
+    let n = el;
+    while (n) {
+      if (n.getAttribute) {
+        const ti = (n.getAttribute('data-testid') || '').toLowerCase();
+        const cls = (n.getAttribute('class') || '').toLowerCase();
+        if (ti.includes('writing-block') || cls.includes('writing-block'))
+          return true;
+        for (const child of (n.children || [])) {
+          if (!child || child.nodeType !== 1) continue;
+          const cti = (child.getAttribute('data-testid') || '').toLowerCase();
+          const ccls = (child.getAttribute('class') || '').toLowerCase();
+          if (cti.includes('writing-block-header') || ccls.includes('magic-edit'))
+            return true;
+        }
+      }
+      n = n.parentElement;
+    }
+    return false;
+  }
+  // Voice / dictation controls are NEVER a send control. A real send button
+  // may not exist yet during Phase A (newer ChatGPT renders it only after
+  // text is present); Phase B re-enumerates after injection and validates it.
+  function isVoiceControl(b) {
+    const s = (((b.getAttribute('aria-label') || '') + ' ' +
+                (b.getAttribute('class') || '') + ' ' +
+                (b.getAttribute('data-testid') || '')).toLowerCase());
+    return /voice|speech|dictat|microphone|mic-|\u8bed\u97f3|\u542c\u5199/.test(s);
+  }
+  function findSendControl(scope) {
+    for (const b of Array.from(scope.querySelectorAll('button'))) {
+      if (isVoiceControl(b)) continue;
+      const tid = b.getAttribute('data-testid') || '';
+      const aria = b.getAttribute('aria-label') || '';
+      if (tid === 'send-button' || /send/i.test(aria) || /\u53d1\u9001/.test(aria))
+        return b;
+    }
+    return null;
+  }
+  // Composer identity anchor: the nearest composer-like FORM wrapping the
+  // editable. ChatGPT renders one composer as BOTH a hidden fallback <textarea>
+  // and a visible contenteditable ProseMirror inside the same form; editables
+  // sharing one anchor are the SAME composer and must collapse to a single
+  // surface. Non-composer forms (no composer/prompt marker) yield null so
+  // unrelated editables stay separate candidates -> ambiguity -> fail closed.
+  function composerAnchor(el) {
+    let n = el;
+    while (n && n.tagName.toLowerCase() !== 'body') {
+      if (n.tagName.toLowerCase() === 'form') {
+        const cls = (n.getAttribute('class') || '');
+        const tid = (n.getAttribute('data-testid') || '');
+        if (/composer|prompt|chat|\u8f93\u5165|\u5bf9\u8bdd/.test(cls + ' ' + tid)) return n;
+        if (n.querySelector('button[data-testid="composer-plus-btn"]')) return n;
+        return null;
+      }
+      n = n.parentElement;
+    }
+    return null;
+  }
+  // Pick the canonical editable of a composer: visible contenteditable wins
+  // over a hidden fallback textarea (ProseMirror over wcDTda_fallbackTextarea).
+  function editableScore(e) {
+    const ce = e.isContentEditable ? 1 : 0;
+    const vis = !!(e.offsetWidth || e.offsetHeight || (e.getClientRects && e.getClientRects().length)) ? 1 : 0;
+    return ce * 4 + vis * 2 + (ce ? 0 : 1);
+  }
+  const editables = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+  // Key groups by DOM element identity (the anchor form, or the editable itself
+  // when there is no composer form), never by cssPath: two structurally
+  // identical sibling forms would otherwise collapse to the same selector.
+  const order = [];
+  const groups = new Map();
+  for (const e of editables) {
+    const anchor = composerAnchor(e);
+    const key = anchor || e;
+    if (groups.has(key)) {
+      if (editableScore(e) > editableScore(groups.get(key))) groups.set(key, e);
+    } else {
+      groups.set(key, e);
+      order.push(key);
+    }
+  }
+  const surfaces = [];
+  for (const key of order) {
+    const e = groups.get(key);
+    // Climb from the editable to the nearest ancestor container that itself
+    // contains a send control; that control is the one bound to this composer's
+    // container/form (not required to be a descendant of the editable).
+    let scope = e;
+    let sendBtn = null;
+    let container_css = null;
+    while (scope && scope.tagName.toLowerCase() !== 'body') {
+      const sb = findSendControl(scope);
+      if (sb) { sendBtn = sb; container_css = cssPath(scope); break; }
+      scope = scope.parentElement;
+    }
+    const send_css = sendBtn ? cssPath(sendBtn) : null;
+    const wb = inWritingBlock(e);
+    const editable_kind = (e.tagName.toLowerCase() === 'textarea') ? 'textarea' : 'contenteditable';
+    surfaces.push({
+      kind: wb ? 'writing-block' : 'chat-composer',
+      node_css: cssPath(e),
+      has_send: !!sendBtn,
+      send_enabled: sendBtn ? !sendBtn.disabled : false,
+      send_css: send_css,
+      send_control_type: sendBtn ? 'send' : null,
+      container_css: container_css,
+      editable_kind: editable_kind,
+      is_writing_block: wb,
+      is_editor: wb
+    });
+  }
+  return JSON.stringify(surfaces);
+})()
+"""
+
+# Read/write respect the editable kind: <textarea> uses .value, contenteditable
+# uses innerText/innerHTML. Any other editable kind is unsupported -> null/false
+# so callers fail closed (never pretend a surface is writable when it is not).
+READ_NODE_JS = ("(()=>{const e=document.querySelector(%s);if(!e)return '';"
+                "if(e.tagName==='TEXTAREA')return e.value||'';"
+                "if(e.isContentEditable)return e.innerText||'';"
+                "return null;})()")
+WRITE_NODE_JS = ("(()=>{const e=document.querySelector(%s);if(!e)return false;e.focus();"
+                 "if(e.tagName==='TEXTAREA'){e.value=%s;}"
+                 "else if(e.isContentEditable){e.innerHTML='';e.innerText=%s;}"
+                 "else{return false;}"
+                 "e.dispatchEvent(new Event('input',{bubbles:true}));return true;})()")
+CLICK_SEND_JS = "(()=>{const b=document.querySelector(%s); if(b && !b.disabled){b.click(); return true;} return false;})()"
+
+
+def _js_str(s):
+    """Quote a value as a JS string literal for embedding in the snippets."""
+    return json.dumps(s)
+
+
+def select_trustworthy_chat_composer(surfaces):
+    """Pure, browser-free Phase A selection of the single trustworthy chat composer.
+
+    Returns (ok, target, reason).
+      ok=True  -> target = {"node_css", "send_css", "send_enabled",
+                            "send_control_type", "container_css", "editable_kind",
+                            "kind": "chat-composer"}
+      ok=False -> caller MUST fail closed (zero mutation).
+
+    Phase A does NOT require a send control: newer ChatGPT renders the send
+    button only after text is present, so an empty-but-real composer is a valid
+    target. Send-control trust is enforced later in Phase B (pre-send), after
+    injection. Strict fail-closed: writing-block/editor surfaces are never
+    targets; zero or >1 candidate composers fail closed.
+    """
+    if not isinstance(surfaces, list) or not surfaces:
+        return False, None, "no-editable-surfaces"
+    candidates = [s for s in surfaces
+                  if not s.get("is_writing_block") and not s.get("is_editor")]
+    if len(candidates) == 0:
+        return False, None, "no-trustworthy-chat-composer"
+    if len(candidates) > 1:
+        return False, None, "ambiguous-multiple-chat-composers"
+    t = candidates[0]
+    node_css = t.get("node_css")
+    if not node_css:
+        return False, None, "selected-composer-missing-node-selector"
+    return True, {
+        "node_css": node_css,
+        "send_css": t.get("send_css"),
+        "send_enabled": t.get("send_enabled"),
+        "send_control_type": t.get("send_control_type"),
+        "container_css": t.get("container_css"),
+        "editable_kind": t.get("editable_kind"),
+        "kind": "chat-composer",
+    }, None
+
+
+def _same_target(a, b):
+    """True when two resolved targets identify the SAME bound composer.
+
+    node_css must match exactly. send_css / container_css are compared only when
+    present on BOTH sides: during Phase A a send control typically does not
+    exist yet (newer ChatGPT renders it only after text), so a later Phase B
+    first appearance must not be treated as drift — but a send control that was
+    already bound in Phase A must be unchanged. A missing node_css on either
+    side means identity cannot be proven -> False (fail closed, no click).
+    """
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get("node_css") != b.get("node_css"):
+        return False
+    sa, sb = a.get("send_css"), b.get("send_css")
+    if sa is not None and sb is not None and sa != sb:
+        return False
+    ca, cb = a.get("container_css"), b.get("container_css")
+    if ca is not None and cb is not None and ca != cb:
+        return False
+    return True
+
+
+class ChatComposerTarget:
+    """Preflight + scoped injection/verification/rollback for the chat composer.
+
+    CDP mechanics are injected as an async `js` callable (same pattern as
+    AttachmentUploader / SendConfirmation) so the orchestration logic is
+    unit-testable without a live browser. `enumerate_surfaces` may be injected
+    to bypass the live DOM enumeration in tests.
+    """
+
+    def __init__(self, js, enumerate_surfaces=None):
+        self.js = js
+        self._enumerate = enumerate_surfaces or self._enumerate_live
+
+    async def _enumerate_live(self):
+        raw = await self.js(ENUMERATE_SURFACES_JS)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = []
+        if not isinstance(raw, list):
+            raw = []
+        return raw
+
+    async def resolve(self):
+        """Enumerate + pure selection. Returns (ok, target, reason)."""
+        surfaces = await self._enumerate()
+        return select_trustworthy_chat_composer(surfaces)
+
+    async def inject(self, target, text):
+        """Write text into the selected node. Captures pre-mutation content for
+        rollback. Returns (ok, pre_content)."""
+        node_css = target["node_css"]
+        pre = await self._read(node_css)
+        target["pre_content"] = pre
+        ok = await self._write(node_css, text)
+        if ok:
+            target["_injected"] = True
+        return bool(ok), pre
+
+    async def verify(self, target, text):
+        """Confirm the injected text is present in the selected node."""
+        cur = await self._read(target["node_css"]) or ""
+        return text.strip() in cur
+
+    async def rollback(self, target):
+        """Restore the selected node to its pre-mutation content. An empty
+        pre-content is written back as empty, so no orphan draft remains. A
+        target that never reached injection is left untouched (no mutation)."""
+        if not target.get("_injected"):
+            return
+        pre = target.get("pre_content") or ""
+        await self._write(target["node_css"], pre)
+
+    async def is_cleared(self, node_css):
+        """True when the selected composer node holds no non-whitespace text."""
+        cur = await self._read(node_css) or ""
+        return cur.strip() == ""
+
+    async def _phase_b_preflight(self, expected_target):
+        """Pre-send preflight: re-enumerate the DOM and PROVE the resolved
+        composer is STILL the same one that received + verified the checkpoint,
+        then locate the trusted send control bound to that same composer
+        container/form. A send control may first appear only after text was
+        injected, so its presence is validated here, not in Phase A.
+
+        Returns (ok, send_css, reason). On any failure the caller must roll back
+        the checkpoint and fail closed (no click)."""
+        surfaces = await self._enumerate()
+        ok, current, reason = select_trustworthy_chat_composer(surfaces)
+        if not ok:
+            return False, None, f"send-preflight-{reason}"
+        if not _same_target(current, expected_target):
+            return False, None, "target-drift"
+        if current.get("send_control_type") == "voice":
+            return False, None, "voice-only-control"
+        send_css = current.get("send_css")
+        if not send_css or not current.get("send_enabled"):
+            return False, None, "no-trusted-send-control"
+        return True, send_css, None
+
+    async def click_send(self, expected_target=None):
+        """Phase B: preflight before EACH send and PROVE the resolved target is
+        STILL the same composer that received + verified the checkpoint, then
+        click the send control bound to that same composer container/form. The
+        send control must be a real send control (voice/dictation excluded) and
+        enabled. Any identity mismatch, target disappearance, reorder ambiguity,
+        absent/disabled send control, voice-only control, OR a send control that
+        vanishes / goes disabled at the instant of the click fails closed: the
+        checkpoint is rolled back and NO click is dispatched (no complex
+        auto-recovery)."""
+        if expected_target is None:
+            print("RELAY_TARGET_DRIFT: no bound target to preflight against; "
+                  "refusing to click any send control.")
+            return False
+        ok, send_css, reason = await self._phase_b_preflight(expected_target)
+        if not ok:
+            print(f"RELAY_TARGET_DRIFT: {reason}; rolling back checkpoint, "
+                  f"no click.")
+            await self.rollback(expected_target)
+            return False
+        clicked = await self._click(send_css)
+        if not clicked:
+            # The preflight proved the send control a moment earlier, but the
+            # click itself did not dispatch (button disappeared / became
+            # disabled in between). The injected checkpoint must not be left in
+            # the composer: roll back to the exact pre-mutation content.
+            print("RELAY_TARGET_DRIFT: send control unavailable at click instant "
+                  "(disappeared or disabled after preflight); rolling back "
+                  "checkpoint, no click dispatched.")
+            await self.rollback(expected_target)
+            return False
+        return True
+
+    async def _read(self, node_css):
+        return await self.js(READ_NODE_JS % _js_str(node_css)) or ""
+
+    async def _write(self, node_css, text):
+        # WRITE_NODE_JS fills the same text into both the <textarea> .value branch
+        # and the contenteditable innerText branch.
+        return await self.js(WRITE_NODE_JS % (_js_str(node_css), _js_str(text), _js_str(text)))
+
+    async def _click(self, css):
+        return await self.js(CLICK_SEND_JS % _js_str(css))
+
+
 async def upload_attachments(uploader, paths):
     """Upload every evidence attachment; stop at the first failure.
 
@@ -596,26 +970,53 @@ async def run_relay(args):
         except (TypeError, ValueError):
             user_count_before = 0
 
-        # Inject request text using exact DOM interactions
-        esc_text = json.dumps(request_text)
-        await js(f"(()=>{{const e=document.querySelector('[contenteditable=true]');if(!e)return false;e.focus();e.innerHTML='';e.innerText={esc_text};e.dispatchEvent(new Event('input',{{bubbles:true}}));return true}})()")
-        await asyncio.sleep(1)
-        
-        # Click send and STRONGLY confirm delivery before waiting for the
-        # assistant turn. "Send button clicked" is NOT "message delivered": if
-        # the click lands while ChatGPT is still processing freshly-uploaded
-        # attachments, the send can be silently swallowed and the draft stays
-        # in the composer. The three-state delivery state machine lives in
-        # SendConfirmation (unit-tested); here we wire it to the live CDP js()
-        # helpers. See SendConfirmation for the full state model.
+        # ── Chat composer targeting: Phase A pre-mutation preflight ─────────
+        # Before ANY DOM mutation, enumerate editable surfaces and select the
+        # single trustworthy chat composer (fail closed when 0 or >1). A send
+        # control need NOT exist yet (newer ChatGPT renders it only after text).
+        # Inject only into the selected node, verify the payload landed, and
+        # ROLL BACK to the pre-mutation content on verification failure so no
+        # orphan draft is left behind. Send-control trust is enforced in Phase B
+        # (pre-send). See ChatComposerTarget / select_trustworthy_chat_composer.
         send_confirm_timeout = getattr(args, "send_confirm_timeout", SEND_CONFIRM_TIMEOUT)
         send_pending_timeout = getattr(args, "send_pending_timeout", SEND_PENDING_TIMEOUT)
 
+        composer_target = ChatComposerTarget(js)
+        resolved, target, reason = await composer_target.resolve()
+        if not resolved:
+            print(f"Error: RELAY_TARGET_FAIL_CLOSED: {reason}. "
+                  f"Refusing to mutate any composer.")
+            return 1
+
+        ok, _pre = await composer_target.inject(target, request_text)
+        if not ok:
+            print("Error: RELAY_INJECT_FAILED: could not write to the selected "
+                  "composer. Refusing to send (no mutation left behind).")
+            return 1
+
+        await asyncio.sleep(0.5)  # let the input event settle before verifying
+        if not await composer_target.verify(target, request_text):
+            print("Error: RELAY_INJECT_VERIFY_FAILED: injected text not present in "
+                  "the selected composer. Rolling back to pre-mutation content; "
+                  "no orphan draft left behind.")
+            await composer_target.rollback(target)
+            return 1
+
+        node_css = target["node_css"]
+
         async def _click_send():
-            return await js("(()=>{const b=document.querySelector('button[data-testid=\\'send-button\\']'); if(b && !b.disabled){b.click(); return true;} return false;})()")
+            # Phase B (pre-send): re-enumerate and prove the resolved target is
+            # STILL the same composer that received + verified the checkpoint,
+            # then click the send control bound to that same composer
+            # container/form (voice/dictation excluded, must be enabled). Any
+            # identity mismatch / disappearance / reorder ambiguity / absent
+            # send / voice-only control -> rollback the checkpoint + fail closed
+            # (no click, no complex auto-recovery).
+            return await composer_target.click_send(expected_target=target)
 
         async def _composer_cleared():
-            return bool(await js("(()=>{const e=document.querySelector('[contenteditable=true]');return !e || ((e.innerText||'').trim().length===0);})()"))
+            # Scoped to the selected composer node (no first-match heuristic).
+            return await composer_target.is_cleared(node_css)
 
         async def _turn_counts():
             n = await js("(()=>{const r=document.querySelectorAll('[data-message-author-role]');let u=0,a=0;r.forEach(x=>{const v=x.getAttribute('data-message-author-role');if(v==='user')u++;else if(v==='assistant')a++;});return JSON.stringify({u:u,a:a});})()")
