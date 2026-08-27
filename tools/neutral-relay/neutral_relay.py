@@ -402,7 +402,10 @@ class SendConfirmation:
 
 # Enumerate every editable surface and report, for each, a stable unique CSS
 # selector (node_css), whether it is a writing-block/editor (excluded), and the
-# send control (send_css) bound to its nearest container/form.
+# send control (send_css) bound to its nearest container/form. Editables that
+# share one composer-like FORM (e.g. ChatGPT's hidden fallback textarea + the
+# visible ProseMirror in the same <form class="group/composer">) are collapsed
+# to a single surface so the same composer is never seen as two candidates.
 ENUMERATE_SURFACES_JS = r"""
 (() => {
   function cssPath(el) {
@@ -454,31 +457,74 @@ ENUMERATE_SURFACES_JS = r"""
     }
     return false;
   }
-  const surfaces = [];
+  // Voice / dictation controls are NEVER a send control. A real send button
+  // may not exist yet during Phase A (newer ChatGPT renders it only after
+  // text is present); Phase B re-enumerates after injection and validates it.
+  function isVoiceControl(b) {
+    const s = (((b.getAttribute('aria-label') || '') + ' ' +
+                (b.getAttribute('class') || '') + ' ' +
+                (b.getAttribute('data-testid') || '')).toLowerCase());
+    return /voice|speech|dictat|microphone|mic-|\u8bed\u97f3|\u542c\u5199/.test(s);
+  }
+  function findSendControl(scope) {
+    for (const b of Array.from(scope.querySelectorAll('button'))) {
+      if (isVoiceControl(b)) continue;
+      const tid = b.getAttribute('data-testid') || '';
+      const aria = b.getAttribute('aria-label') || '';
+      if (tid === 'send-button' || /send/i.test(aria) || /\u53d1\u9001/.test(aria))
+        return b;
+    }
+    return null;
+  }
+  // Composer identity anchor: the nearest composer-like FORM wrapping the
+  // editable. ChatGPT renders one composer as BOTH a hidden fallback <textarea>
+  // and a visible contenteditable ProseMirror inside the same form; editables
+  // sharing one anchor are the SAME composer and must collapse to a single
+  // surface. Non-composer forms (no composer/prompt marker) yield null so
+  // unrelated editables stay separate candidates -> ambiguity -> fail closed.
+  function composerAnchor(el) {
+    let n = el;
+    while (n && n.tagName.toLowerCase() !== 'body') {
+      if (n.tagName.toLowerCase() === 'form') {
+        const cls = (n.getAttribute('class') || '');
+        const tid = (n.getAttribute('data-testid') || '');
+        if (/composer|prompt|chat|\u8f93\u5165|\u5bf9\u8bdd/.test(cls + ' ' + tid)) return n;
+        if (n.querySelector('button[data-testid="composer-plus-btn"]')) return n;
+        return null;
+      }
+      n = n.parentElement;
+    }
+    return null;
+  }
+  // Pick the canonical editable of a composer: visible contenteditable wins
+  // over a hidden fallback textarea (ProseMirror over wcDTda_fallbackTextarea).
+  function editableScore(e) {
+    const ce = e.isContentEditable ? 1 : 0;
+    const vis = !!(e.offsetWidth || e.offsetHeight || (e.getClientRects && e.getClientRects().length)) ? 1 : 0;
+    return ce * 4 + vis * 2 + (ce ? 0 : 1);
+  }
   const editables = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+  // Key groups by DOM element identity (the anchor form, or the editable itself
+  // when there is no composer form), never by cssPath: two structurally
+  // identical sibling forms would otherwise collapse to the same selector.
+  const order = [];
+  const groups = new Map();
   for (const e of editables) {
+    const anchor = composerAnchor(e);
+    const key = anchor || e;
+    if (groups.has(key)) {
+      if (editableScore(e) > editableScore(groups.get(key))) groups.set(key, e);
+    } else {
+      groups.set(key, e);
+      order.push(key);
+    }
+  }
+  const surfaces = [];
+  for (const key of order) {
+    const e = groups.get(key);
     // Climb from the editable to the nearest ancestor container that itself
     // contains a send control; that control is the one bound to this composer's
     // container/form (not required to be a descendant of the editable).
-    // Voice / dictation controls are NEVER a send control. A real send button
-    // may not exist yet during Phase A (newer ChatGPT renders it only after
-    // text is present); Phase B re-enumerates after injection and validates it.
-    function isVoiceControl(b) {
-      const s = (((b.getAttribute('aria-label') || '') + ' ' +
-                  (b.getAttribute('class') || '') + ' ' +
-                  (b.getAttribute('data-testid') || '')).toLowerCase());
-      return /voice|speech|dictat|microphone|mic-|\u8bed\u97f3|\u542c\u5199/.test(s);
-    }
-    function findSendControl(scope) {
-      for (const b of Array.from(scope.querySelectorAll('button'))) {
-        if (isVoiceControl(b)) continue;
-        const tid = b.getAttribute('data-testid') || '';
-        const aria = b.getAttribute('aria-label') || '';
-        if (tid === 'send-button' || /send/i.test(aria) || /\u53d1\u9001/.test(aria))
-          return b;
-      }
-      return null;
-    }
     let scope = e;
     let sendBtn = null;
     let container_css = null;
