@@ -12,13 +12,16 @@ import neutral_relay as nr
 
 def chat_surface(node_css="#chat-0", send_css="#send-0", has_send=True,
                  send_enabled=True, is_wb=False, editable_kind="contenteditable",
-                 container_css=None):
+                 container_css=None, send_control_type=None):
+    if send_control_type is None:
+        send_control_type = "send" if has_send else None
     return {
         "kind": "writing-block" if is_wb else "chat-composer",
         "node_css": node_css,
         "has_send": has_send,
         "send_enabled": send_enabled,
         "send_css": send_css,
+        "send_control_type": send_control_type,
         "container_css": container_css,
         "editable_kind": editable_kind,
         "is_writing_block": is_wb,
@@ -144,13 +147,16 @@ class TestSelectTrustworthy(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "ambiguous-multiple-chat-composers")
 
-    def test_stale_send_selector_fail_closed(self):
-        # chat candidate exists but its send control is missing/disabled
-        # (the stale send-button selector matched 0) -> fail closed.
+    def test_empty_composer_without_send_is_phase_a_target(self):
+        # Newer ChatGPT renders the send button only after text is present, so
+        # Phase A must NOT require a send control: an empty-but-real composer is
+        # a valid target. Send-control trust is enforced in Phase B (pre-send).
         ok, t, reason = nr.select_trustworthy_chat_composer(
             [chat_surface(has_send=False, send_enabled=False, send_css=None)])
-        self.assertFalse(ok)
-        self.assertEqual(reason, "no-trustworthy-chat-composer")
+        self.assertTrue(ok)
+        self.assertEqual(t["node_css"], "#chat-0")
+        self.assertIsNone(reason)
+        self.assertIsNone(t["send_css"])
 
     def test_empty_surfaces_fail_closed(self):
         ok, t, reason = nr.select_trustworthy_chat_composer([])
@@ -189,12 +195,6 @@ class TestComposerTargetOrchestration(unittest.TestCase):
 
     def test_ambiguous_zero_mutation(self):
         fake = FakeBrowser([chat_surface(node_css="#a"), chat_surface(node_css="#b")])
-        status, t, fake = asyncio.run(run_inject_phase(fake, "X"))
-        self.assertTrue(status.startswith("fail-closed-resolve"))
-        self.assertEqual(fake.nodes, {})
-
-    def test_stale_send_zero_mutation(self):
-        fake = FakeBrowser([chat_surface(has_send=False, send_enabled=False, send_css=None)])
         status, t, fake = asyncio.run(run_inject_phase(fake, "X"))
         self.assertTrue(status.startswith("fail-closed-resolve"))
         self.assertEqual(fake.nodes, {})
@@ -361,6 +361,107 @@ class TestEditableKindReadWrite(unittest.TestCase):
         status, t, fake = asyncio.run(run_inject_phase(fake, "TEXT"))
         self.assertEqual(status, "fail-inject")  # write refused, zero mutation
         self.assertEqual(fake.nodes, {})
+
+
+class TestTwoPhaseModel(unittest.TestCase):
+    """PR #122 two-phase targeting regressions: Phase A (pre-mutation composer
+    preflight, no send control required) + Phase B (pre-send re-preflight that
+    proves same-target identity and locates a trusted send control, excluding
+    voice/dictation). Any Phase B failure rolls back the checkpoint and fails
+    closed with NO click."""
+
+    def test_phase_a_empty_composer_no_send_then_send_appears(self):
+        # empty composer, no send initially -> Phase A allowed; after inject the
+        # send control appears -> Phase B proves same target -> click succeeds.
+        fake = FakeBrowser([chat_surface(node_css="#chat-0", has_send=False,
+                                         send_enabled=False, send_css=None)])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)  # Phase A does NOT require a send control
+        self.assertIsNone(t["send_css"])
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        self.assertTrue(await_wrap(target.verify(t, "CHECKPOINT TEXT")))
+        # ChatGPT now renders the send button (text is present).
+        fake._surfaces = json.dumps([chat_surface(node_css="#chat-0", has_send=True,
+                                                  send_enabled=True, send_css="#send-0")])
+        self.assertTrue(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 1)
+        self.assertEqual(fake.clicked_css, ["#send-0"])
+
+    def test_phase_b_send_never_appears_rollback_fail_closed(self):
+        # empty composer, no send initially -> inject OK, but the send control
+        # never appears -> Phase B rolls back the checkpoint and fails closed
+        # (no orphan draft, no click).
+        fake = FakeBrowser([chat_surface(node_css="#chat-0", has_send=False,
+                                         send_enabled=False, send_css=None)])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        self.assertTrue(await_wrap(target.verify(t, "CHECKPOINT TEXT")))
+        # surfaces stay send-less -> Phase B fails -> rollback -> no orphan.
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)
+        self.assertEqual(fake.nodes.get("#chat-0", ""), "")  # restored empty
+        self.assertNotIn("CHECKPOINT TEXT", fake.nodes.get("#chat-0", ""))
+
+    def test_voice_button_not_treated_as_send(self):
+        # A voice/dictation control must never be used as the send control.
+        fake = FakeBrowser([chat_surface(node_css="#chat-0", has_send=True,
+                                         send_enabled=True, send_css="#voice-btn",
+                                         send_control_type="voice")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)  # voice control is NOT clicked
+        self.assertEqual(fake.nodes.get("#chat-0", ""), "")  # rollback, no orphan
+
+    def test_phase_b_resolves_different_composer_rollback_fail_closed(self):
+        # composer A injected; Phase B resolves a DIFFERENT composer -> rollback
+        # the checkpoint + fail closed, no click.
+        fake = FakeBrowser([chat_surface(node_css="#a", send_css="#send-a")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        fake._surfaces = json.dumps([chat_surface(node_css="#b", send_css="#send-b")])
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)
+        self.assertEqual(fake.nodes.get("#a", ""), "")  # A restored, no orphan
+
+    def test_writing_block_plus_real_empty_composer_only_real_selected(self):
+        # writing-block + a real empty composer (no send yet) -> Phase A selects
+        # only the real composer.
+        surfaces = [chat_surface(node_css="#wb", is_wb=True, has_send=False),
+                    chat_surface(node_css="#chat-0", has_send=False,
+                                 send_enabled=False, send_css=None)]
+        ok, t, _ = nr.select_trustworthy_chat_composer(surfaces)
+        self.assertTrue(ok)
+        self.assertEqual(t["node_css"], "#chat-0")
+        self.assertFalse(t["send_css"])
+
+    def test_textarea_phase_a_then_send_appears(self):
+        # textarea read/write semantics stay correct through both phases.
+        fake = FakeBrowser([chat_surface(node_css="#ta", editable_kind="textarea",
+                                         has_send=False, send_enabled=False, send_css=None)])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        self.assertTrue(await_wrap(target.verify(t, "CHECKPOINT TEXT")))
+        fake._surfaces = json.dumps([chat_surface(node_css="#ta", editable_kind="textarea",
+                                                  has_send=True, send_enabled=True, send_css="#send-ta")])
+        self.assertTrue(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 1)
+        self.assertEqual(fake.clicked_css, ["#send-ta"])
+        self.assertEqual(fake.nodes["#ta"], "CHECKPOINT TEXT")
 
 
 def await_wrap(coro):
