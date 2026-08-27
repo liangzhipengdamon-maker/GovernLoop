@@ -421,15 +421,28 @@ ENUMERATE_SURFACES_JS = r"""
     return parts.join(' > ');
   }
   function inWritingBlock(el) {
+    // ProseMirror is an editor technology, NOT proof of a writing-block, so it
+    // is never used as identity. writing-block/editor markers must be LOCAL to
+    // the container that also holds this editable: the container node itself is
+    // a writing-block, or a marker (writing-block-header / magic-edit) is a
+    // DIRECT child of a container on this editable's ancestor chain. Deep
+    // descendants under a shared high-level ancestor are deliberately ignored,
+    // so an unrelated sibling writing-block cannot contaminate classification.
+    // Genuinely ambiguous identity -> treated as writing-block (fail closed).
     let n = el;
     while (n) {
       if (n.getAttribute) {
         const ti = (n.getAttribute('data-testid') || '').toLowerCase();
         const cls = (n.getAttribute('class') || '').toLowerCase();
-        if (ti.includes('writing-block') || cls.includes('writing-block') ||
-            cls.includes('prosemirror')) return true;
-        if (n.querySelector && n.querySelector('[data-testid*="writing-block-header"], button[class*="magic-edit"]'))
+        if (ti.includes('writing-block') || cls.includes('writing-block'))
           return true;
+        for (const child of (n.children || [])) {
+          if (!child || child.nodeType !== 1) continue;
+          const cti = (child.getAttribute('data-testid') || '').toLowerCase();
+          const ccls = (child.getAttribute('class') || '').toLowerCase();
+          if (cti.includes('writing-block-header') || ccls.includes('magic-edit'))
+            return true;
+        }
       }
       n = n.parentElement;
     }
@@ -443,19 +456,23 @@ ENUMERATE_SURFACES_JS = r"""
     // container/form (not required to be a descendant of the editable).
     let scope = e;
     let sendBtn = null;
+    let container_css = null;
     while (scope && scope.tagName.toLowerCase() !== 'body') {
       const sb = scope.querySelector('button[data-testid="send-button"], button[aria-label*="Send"], button[aria-label*="\u53d1\u9001"]');
-      if (sb) { sendBtn = sb; break; }
+      if (sb) { sendBtn = sb; container_css = cssPath(scope); break; }
       scope = scope.parentElement;
     }
     const send_css = sendBtn ? cssPath(sendBtn) : null;
     const wb = inWritingBlock(e);
+    const editable_kind = (e.tagName.toLowerCase() === 'textarea') ? 'textarea' : 'contenteditable';
     surfaces.push({
       kind: wb ? 'writing-block' : 'chat-composer',
       node_css: cssPath(e),
       has_send: !!sendBtn,
       send_enabled: sendBtn ? !sendBtn.disabled : false,
       send_css: send_css,
+      container_css: container_css,
+      editable_kind: editable_kind,
       is_writing_block: wb,
       is_editor: wb
     });
@@ -464,8 +481,18 @@ ENUMERATE_SURFACES_JS = r"""
 })()
 """
 
-READ_NODE_JS = "(()=>{const e=document.querySelector(%s);return e?(e.innerText||''):'';})()"
-WRITE_NODE_JS = "(()=>{const e=document.querySelector(%s);if(!e)return false;e.focus();e.innerHTML='';e.innerText=%s;e.dispatchEvent(new Event('input',{bubbles:true}));return true;})()"
+# Read/write respect the editable kind: <textarea> uses .value, contenteditable
+# uses innerText/innerHTML. Any other editable kind is unsupported -> null/false
+# so callers fail closed (never pretend a surface is writable when it is not).
+READ_NODE_JS = ("(()=>{const e=document.querySelector(%s);if(!e)return '';"
+                "if(e.tagName==='TEXTAREA')return e.value||'';"
+                "if(e.isContentEditable)return e.innerText||'';"
+                "return null;})()")
+WRITE_NODE_JS = ("(()=>{const e=document.querySelector(%s);if(!e)return false;e.focus();"
+                 "if(e.tagName==='TEXTAREA'){e.value=%s;}"
+                 "else if(e.isContentEditable){e.innerHTML='';e.innerText=%s;}"
+                 "else{return false;}"
+                 "e.dispatchEvent(new Event('input',{bubbles:true}));return true;})()")
 CLICK_SEND_JS = "(()=>{const b=document.querySelector(%s); if(b && !b.disabled){b.click(); return true;} return false;})()"
 
 
@@ -502,8 +529,29 @@ def select_trustworthy_chat_composer(surfaces):
     return True, {
         "node_css": node_css,
         "send_css": t.get("send_css"),
+        "container_css": t.get("container_css"),
+        "editable_kind": t.get("editable_kind"),
         "kind": "chat-composer",
     }, None
+
+
+def _same_target(a, b):
+    """True when two resolved targets identify the SAME bound composer.
+
+    node_css + send_css must match exactly; container_css, when present on both
+    sides, must also match. Any missing selector on either side means same-target
+    identity cannot be proven -> False (fail closed, no click).
+    """
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get("node_css") != b.get("node_css"):
+        return False
+    if a.get("send_css") != b.get("send_css"):
+        return False
+    ca, cb = a.get("container_css"), b.get("container_css")
+    if ca is not None and cb is not None and ca != cb:
+        return False
+    return True
 
 
 class ChatComposerTarget:
@@ -560,16 +608,27 @@ class ChatComposerTarget:
         cur = await self._read(node_css) or ""
         return cur.strip() == ""
 
-    async def click_send(self):
-        """Re-preflight before EACH send (dynamic DOM reorder -> fail closed),
-        then click the send control bound to the trustworthy composer
-        container/form. Returns True only when a click was dispatched."""
-        ok, target, reason = await self.resolve()
+    async def click_send(self, expected_target=None):
+        """Re-preflight before EACH send and PROVE the resolved target is STILL
+        the same composer that received and verified the checkpoint, then click
+        the send control bound to that composer container/form. Any identity
+        mismatch, target disappearance, or reorder ambiguity fails closed (no
+        click, no complex auto-recovery)."""
+        if expected_target is None:
+            print("RELAY_TARGET_DRIFT: no bound target to re-preflight against; "
+                  "refusing to click any send control.")
+            return False
+        ok, current, reason = await self.resolve()
         if not ok:
             print(f"RELAY_TARGET_DRIFT: send preflight failed ({reason}); "
                   f"refusing to click any send control.")
             return False
-        css = target.get("send_css")
+        if not _same_target(current, expected_target):
+            print("RELAY_TARGET_DRIFT: re-preflight resolved a DIFFERENT composer "
+                  "than the one that received the checkpoint; refusing to click "
+                  "any send control.")
+            return False
+        css = expected_target.get("send_css")
         if not css:
             return False
         return await self._click(css)
@@ -578,7 +637,9 @@ class ChatComposerTarget:
         return await self.js(READ_NODE_JS % _js_str(node_css)) or ""
 
     async def _write(self, node_css, text):
-        return await self.js(WRITE_NODE_JS % (_js_str(node_css), _js_str(text)))
+        # WRITE_NODE_JS fills the same text into both the <textarea> .value branch
+        # and the contenteditable innerText branch.
+        return await self.js(WRITE_NODE_JS % (_js_str(node_css), _js_str(text), _js_str(text)))
 
     async def _click(self, css):
         return await self.js(CLICK_SEND_JS % _js_str(css))
@@ -829,10 +890,12 @@ async def run_relay(args):
         node_css = target["node_css"]
 
         async def _click_send():
-            # Re-preflight before EACH send (PO: dynamic DOM reorder -> fail
-            # closed, no complex auto-recovery). Scope the click to the send
-            # control bound to the trustworthy composer container/form.
-            return await composer_target.click_send()
+            # Re-preflight before EACH send and prove the resolved target is
+            # STILL the same composer that received + verified the checkpoint
+            # (fail closed on identity mismatch / disappearance / reorder
+            # ambiguity; no complex auto-recovery). Scope the click to the send
+            # control bound to that same composer container/form.
+            return await composer_target.click_send(expected_target=target)
 
         async def _composer_cleared():
             # Scoped to the selected composer node (no first-match heuristic).

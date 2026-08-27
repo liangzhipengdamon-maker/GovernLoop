@@ -11,13 +11,16 @@ import neutral_relay as nr
 
 
 def chat_surface(node_css="#chat-0", send_css="#send-0", has_send=True,
-                 send_enabled=True, is_wb=False):
+                 send_enabled=True, is_wb=False, editable_kind="contenteditable",
+                 container_css=None):
     return {
         "kind": "writing-block" if is_wb else "chat-composer",
         "node_css": node_css,
         "has_send": has_send,
         "send_enabled": send_enabled,
         "send_css": send_css,
+        "container_css": container_css,
+        "editable_kind": editable_kind,
         "is_writing_block": is_wb,
         "is_editor": is_wb,
     }
@@ -38,19 +41,42 @@ class FakeBrowser:
         self.clicks = 0
         self.clicked_css = []
 
+    def _editable_kind_of(self, css):
+        try:
+            s_list = json.loads(self._surfaces) if isinstance(self._surfaces, str) else self._surfaces
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "contenteditable"
+        for s in s_list:
+            if s.get("node_css") == css:
+                k = s.get("editable_kind")
+                if k:
+                    return k
+        return "contenteditable"
+
     async def js(self, expr):
         if expr == nr.ENUMERATE_SURFACES_JS or expr.startswith(nr.ENUMERATE_SURFACES_JS.strip()):
             return self._surfaces
-        if "innerHTML=''" in expr:  # WRITE
+        if "e.focus()" in expr and "dispatchEvent(new Event('input'" in expr:  # WRITE
             m = re.search(
-                r"document\.querySelector\((['\"])(.*?)\1\);if\(!e\)return false;e\.focus\(\);"
-                r"e\.innerHTML='';e\.innerText=(.*?);e\.dispatchEvent", expr, re.S)
-            if m:
-                css = m.group(2)
-                text = json.loads(m.group(3))
-                self.nodes[css] = text
+                r"document\.querySelector\((['\"])(.*?)\1\);if\(!e\)return false;e\.focus\(\);",
+                expr, re.S)
+            if not m:
+                return False
+            css = m.group(2)
+            kind = self._editable_kind_of(css)
+            if kind == "textarea":
+                m2 = re.search(r"\{e\.value=(.*?);\}", expr, re.S)
+                if not m2:
+                    return False
+                self.nodes[css] = json.loads(m2.group(1))
                 return True
-            return False
+            if kind == "contenteditable":
+                m2 = re.search(r"e\.innerHTML='';e\.innerText=(.*?);", expr, re.S)
+                if not m2:
+                    return False
+                self.nodes[css] = json.loads(m2.group(1))
+                return True
+            return False  # unsupported editable kind -> write refuses (fail closed)
         if "b.click()" in expr:  # CLICK
             m = re.search(r"document\.querySelector\((['\"])(.*?)\1\); if\(b && !b\.disabled\)", expr)
             if m:
@@ -61,12 +87,15 @@ class FakeBrowser:
                     return True
                 return False
             return False
-        # READ (fallback)
-        m = re.search(r"document\.querySelector\((['\"])(.*?)\1\);return e\?\(e\.innerText", expr)
+        # READ
+        m = re.search(r"document\.querySelector\((['\"])(.*?)\1\);if\(!e\)return '';", expr)
         if m:
             css = m.group(2)
             if self.corrupt_read:
                 return ""  # simulate the injected text never landing
+            kind = self._editable_kind_of(css)
+            if kind not in ("textarea", "contenteditable"):
+                return None  # unsupported editable kind -> fail closed
             return self.nodes.get(css, "")
         return None
 
@@ -200,16 +229,18 @@ class TestComposerTargetOrchestration(unittest.TestCase):
     def test_click_send_uses_bound_send_control(self):
         fake = FakeBrowser([chat_surface(node_css="#editable", send_css="#container > button.send")])
         target = nr.ChatComposerTarget(fake.js)
-        asyncio.run(target.resolve())
-        self.assertTrue(await_wrap(target.click_send()))
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        self.assertTrue(await_wrap(target.click_send(expected_target=t)))
         self.assertEqual(fake.clicks, 1)
         self.assertEqual(fake.clicked_css, ["#container > button.send"])
 
     def test_click_send_missing_send_css_fails(self):
         fake = FakeBrowser([chat_surface(has_send=True, send_enabled=True, send_css=None)])
         target = nr.ChatComposerTarget(fake.js)
-        asyncio.run(target.resolve())
-        self.assertFalse(await_wrap(target.click_send()))
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
         self.assertEqual(fake.clicks, 0)
 
     def test_click_send_repreflight_drift_fail_closed(self):
@@ -217,13 +248,14 @@ class TestComposerTargetOrchestration(unittest.TestCase):
         # no complex auto-recovery.
         fake = FakeBrowser([chat_surface()])
         target = nr.ChatComposerTarget(fake.js)
-        asyncio.run(target.resolve())
-        self.assertTrue(await_wrap(target.click_send()))
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        self.assertTrue(await_wrap(target.click_send(expected_target=t)))
         self.assertEqual(fake.clicks, 1)
         # Simulate a DOM reorder: the trustworthy target is gone on the next send.
         fake._surfaces = json.dumps(
             [chat_surface(node_css="#c", has_send=False, send_enabled=False, send_css=None)])
-        self.assertFalse(await_wrap(target.click_send()))
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
         self.assertEqual(fake.clicks, 1)  # no extra click dispatched after drift
 
     def test_is_cleared_scoped_to_selected_node(self):
@@ -233,6 +265,102 @@ class TestComposerTargetOrchestration(unittest.TestCase):
         self.assertFalse(await_wrap(target.is_cleared("#chat-0")))
         fake.nodes["#chat-0"] = "   "
         self.assertTrue(await_wrap(target.is_cleared("#chat-0")))
+
+
+class TestClickSendSameTargetIdentity(unittest.TestCase):
+    """Issue 2 regressions: send re-preflight must prove the target is STILL the
+    same composer that received + verified the checkpoint, else fail closed
+    (no click, no complex auto-recovery)."""
+
+    def test_same_target_after_repreflight_send_allowed(self):
+        fake = FakeBrowser([chat_surface(node_css="#a", send_css="#send-a", container_css="#cont-a")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        self.assertTrue(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 1)
+        self.assertEqual(fake.clicked_css, ["#send-a"])
+
+    def test_original_disappears_and_b_unique_fail_closed(self):
+        # original composer A disappears; B becomes the only trustworthy composer
+        # -> re-preflight resolves a DIFFERENT target -> fail closed, no click.
+        fake = FakeBrowser([chat_surface(node_css="#a", send_css="#send-a")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        fake._surfaces = json.dumps([chat_surface(node_css="#b", send_css="#send-b")])
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)
+
+    def test_send_control_changed_fail_closed(self):
+        # same composer node but the send control moved to a different
+        # container/control -> identity mismatch -> fail closed, no click.
+        fake = FakeBrowser([chat_surface(node_css="#a", send_css="#send-a", container_css="#cont-a")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        fake._surfaces = json.dumps(
+            [chat_surface(node_css="#a", send_css="#send-b", container_css="#cont-b")])
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)
+
+    def test_send_control_changed_same_node_fail_closed(self):
+        # node_css matches but send_css differs -> still an identity mismatch.
+        fake = FakeBrowser([chat_surface(node_css="#a", send_css="#send-a")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        fake._surfaces = json.dumps([chat_surface(node_css="#a", send_css="#send-b")])
+        self.assertFalse(await_wrap(target.click_send(expected_target=t)))
+        self.assertEqual(fake.clicks, 0)
+
+    def test_no_bound_target_fail_closed(self):
+        # clicking without a bound target cannot prove same-target identity.
+        fake = FakeBrowser([chat_surface()])
+        target = nr.ChatComposerTarget(fake.js)
+        self.assertFalse(await_wrap(target.click_send()))
+        self.assertEqual(fake.clicks, 0)
+
+
+class TestEditableKindReadWrite(unittest.TestCase):
+    """Issue 3 regressions: textarea reads/writes via .value, contenteditable
+    unchanged, unsupported editable kind fails closed."""
+
+    def test_textarea_read_write_verify(self):
+        fake = FakeBrowser([chat_surface(node_css="#ta", editable_kind="textarea")])
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, _pre = asyncio.run(target.inject(t, "CHECKPOINT TEXT"))
+        self.assertTrue(ok2)
+        self.assertTrue(await_wrap(target.verify(t, "CHECKPOINT TEXT")))
+        self.assertEqual(fake.nodes["#ta"], "CHECKPOINT TEXT")
+
+    def test_textarea_rollback_restores_prior_value(self):
+        fake = FakeBrowser([chat_surface(node_css="#ta", editable_kind="textarea")])
+        fake.nodes["#ta"] = "PRIOR DRAFT"
+        target = nr.ChatComposerTarget(fake.js)
+        ok, t, _ = asyncio.run(target.resolve())
+        self.assertTrue(ok)
+        ok2, pre = asyncio.run(target.inject(t, "NEW TEXT"))
+        self.assertTrue(ok2)
+        self.assertEqual(pre, "PRIOR DRAFT")
+        fake.corrupt_read = True
+        self.assertFalse(await_wrap(target.verify(t, "NEW TEXT")))
+        asyncio.run(target.rollback(t))
+        self.assertEqual(fake.nodes["#ta"], "PRIOR DRAFT")
+
+    def test_contenteditable_behavior_unchanged(self):
+        fake = FakeBrowser([chat_surface()])  # default editable_kind=contenteditable
+        status, t, fake = asyncio.run(run_inject_phase(fake, "CHECKPOINT TEXT"))
+        self.assertEqual(status, "ok")
+        self.assertEqual(fake.nodes["#chat-0"], "CHECKPOINT TEXT")
+
+    def test_unsupported_editable_kind_fails_closed(self):
+        fake = FakeBrowser([chat_surface(node_css="#unknown", editable_kind="unknown")])
+        status, t, fake = asyncio.run(run_inject_phase(fake, "TEXT"))
+        self.assertEqual(status, "fail-inject")  # write refused, zero mutation
+        self.assertEqual(fake.nodes, {})
 
 
 def await_wrap(coro):
