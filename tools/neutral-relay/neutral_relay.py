@@ -386,6 +386,204 @@ class SendConfirmation:
         return False, False, False, user_now, assistant_now
 
 
+# ── Chat composer targeting (narrow relay safety fix) ────────────────────────
+# Before ANY DOM mutation, enumerate editable surfaces and select the single
+# trustworthy chat composer. Inject only into the selected node, verify the text
+# landed, and ROLL BACK to the pre-mutation content on verification failure so no
+# orphan draft is left behind. The send control is bound to the same trustworthy
+# composer container/form (it need NOT be a descendant of the editable node).
+# Strict fail-closed: 0 or >1 trustworthy candidates -> zero mutation.
+
+# Enumerate every editable surface and report, for each, a stable unique CSS
+# selector (node_css), whether it is a writing-block/editor (excluded), and the
+# send control (send_css) bound to its nearest container/form.
+ENUMERATE_SURFACES_JS = r"""
+(() => {
+  function cssPath(el) {
+    if (!el) return null;
+    if (el.id) return '#' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id);
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node.tagName.toLowerCase() !== 'body') {
+      let sel = node.tagName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const keep = Array.from(node.classList).filter(c => /[a-z]/i.test(c)).slice(0, 2);
+        sel += keep.map(c => '.' + (window.CSS && CSS.escape ? CSS.escape(c) : c)).join('');
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const sibs = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (sibs.length > 1) sel += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')';
+      }
+      parts.unshift(sel);
+      node = parent;
+    }
+    return parts.join(' > ');
+  }
+  function inWritingBlock(el) {
+    let n = el;
+    while (n) {
+      if (n.getAttribute) {
+        const ti = (n.getAttribute('data-testid') || '').toLowerCase();
+        const cls = (n.getAttribute('class') || '').toLowerCase();
+        if (ti.includes('writing-block') || cls.includes('writing-block') ||
+            cls.includes('prosemirror')) return true;
+        if (n.querySelector && n.querySelector('[data-testid*="writing-block-header"], button[class*="magic-edit"]'))
+          return true;
+      }
+      n = n.parentElement;
+    }
+    return false;
+  }
+  const surfaces = [];
+  const editables = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+  for (const e of editables) {
+    // Climb from the editable to the nearest ancestor container that itself
+    // contains a send control; that control is the one bound to this composer's
+    // container/form (not required to be a descendant of the editable).
+    let scope = e;
+    let sendBtn = null;
+    while (scope && scope.tagName.toLowerCase() !== 'body') {
+      const sb = scope.querySelector('button[data-testid="send-button"], button[aria-label*="Send"], button[aria-label*="\u53d1\u9001"]');
+      if (sb) { sendBtn = sb; break; }
+      scope = scope.parentElement;
+    }
+    const send_css = sendBtn ? cssPath(sendBtn) : null;
+    const wb = inWritingBlock(e);
+    surfaces.push({
+      kind: wb ? 'writing-block' : 'chat-composer',
+      node_css: cssPath(e),
+      has_send: !!sendBtn,
+      send_enabled: sendBtn ? !sendBtn.disabled : false,
+      send_css: send_css,
+      is_writing_block: wb,
+      is_editor: wb
+    });
+  }
+  return JSON.stringify(surfaces);
+})()
+"""
+
+READ_NODE_JS = "(()=>{const e=document.querySelector(%s);return e?(e.innerText||''):'';})()"
+WRITE_NODE_JS = "(()=>{const e=document.querySelector(%s);if(!e)return false;e.focus();e.innerHTML='';e.innerText=%s;e.dispatchEvent(new Event('input',{bubbles:true}));return true;})()"
+CLICK_SEND_JS = "(()=>{const b=document.querySelector(%s); if(b && !b.disabled){b.click(); return true;} return false;})()"
+
+
+def _js_str(s):
+    """Quote a value as a JS string literal for embedding in the snippets."""
+    return json.dumps(s)
+
+
+def select_trustworthy_chat_composer(surfaces):
+    """Pure, browser-free selection of the single trustworthy chat composer.
+
+    Returns (ok, target, reason).
+      ok=True  -> target = {"node_css", "send_css", "kind": "chat-composer"}
+      ok=False -> caller MUST fail closed (zero mutation).
+
+    Strict fail-closed: writing-block/editor surfaces are never targets; a
+    missing or disabled send control, or more than one candidate composer, all
+    fail closed.
+    """
+    if not isinstance(surfaces, list) or not surfaces:
+        return False, None, "no-editable-surfaces"
+    candidates = [s for s in surfaces
+                  if not s.get("is_writing_block") and not s.get("is_editor")]
+    trustworthy = [s for s in candidates
+                   if s.get("has_send") and s.get("send_enabled")]
+    if len(trustworthy) == 0:
+        return False, None, "no-trustworthy-chat-composer"
+    if len(trustworthy) > 1:
+        return False, None, "ambiguous-multiple-chat-composers"
+    t = trustworthy[0]
+    node_css = t.get("node_css")
+    if not node_css:
+        return False, None, "selected-composer-missing-node-selector"
+    return True, {
+        "node_css": node_css,
+        "send_css": t.get("send_css"),
+        "kind": "chat-composer",
+    }, None
+
+
+class ChatComposerTarget:
+    """Preflight + scoped injection/verification/rollback for the chat composer.
+
+    CDP mechanics are injected as an async `js` callable (same pattern as
+    AttachmentUploader / SendConfirmation) so the orchestration logic is
+    unit-testable without a live browser. `enumerate_surfaces` may be injected
+    to bypass the live DOM enumeration in tests.
+    """
+
+    def __init__(self, js, enumerate_surfaces=None):
+        self.js = js
+        self._enumerate = enumerate_surfaces or self._enumerate_live
+
+    async def _enumerate_live(self):
+        raw = await self.js(ENUMERATE_SURFACES_JS)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = []
+        if not isinstance(raw, list):
+            raw = []
+        return raw
+
+    async def resolve(self):
+        """Enumerate + pure selection. Returns (ok, target, reason)."""
+        surfaces = await self._enumerate()
+        return select_trustworthy_chat_composer(surfaces)
+
+    async def inject(self, target, text):
+        """Write text into the selected node. Captures pre-mutation content for
+        rollback. Returns (ok, pre_content)."""
+        node_css = target["node_css"]
+        pre = await self._read(node_css)
+        target["pre_content"] = pre
+        ok = await self._write(node_css, text)
+        return bool(ok), pre
+
+    async def verify(self, target, text):
+        """Confirm the injected text is present in the selected node."""
+        cur = await self._read(target["node_css"]) or ""
+        return text.strip() in cur
+
+    async def rollback(self, target):
+        """Restore the selected node to its pre-mutation content. An empty
+        pre-content is written back as empty, so no orphan draft remains."""
+        pre = target.get("pre_content") or ""
+        await self._write(target["node_css"], pre)
+
+    async def is_cleared(self, node_css):
+        """True when the selected composer node holds no non-whitespace text."""
+        cur = await self._read(node_css) or ""
+        return cur.strip() == ""
+
+    async def click_send(self):
+        """Re-preflight before EACH send (dynamic DOM reorder -> fail closed),
+        then click the send control bound to the trustworthy composer
+        container/form. Returns True only when a click was dispatched."""
+        ok, target, reason = await self.resolve()
+        if not ok:
+            print(f"RELAY_TARGET_DRIFT: send preflight failed ({reason}); "
+                  f"refusing to click any send control.")
+            return False
+        css = target.get("send_css")
+        if not css:
+            return False
+        return await self._click(css)
+
+    async def _read(self, node_css):
+        return await self.js(READ_NODE_JS % _js_str(node_css)) or ""
+
+    async def _write(self, node_css, text):
+        return await self.js(WRITE_NODE_JS % (_js_str(node_css), _js_str(text)))
+
+    async def _click(self, css):
+        return await self.js(CLICK_SEND_JS % _js_str(css))
+
+
 async def upload_attachments(uploader, paths):
     """Upload every evidence attachment; stop at the first failure.
 
@@ -596,26 +794,49 @@ async def run_relay(args):
         except (TypeError, ValueError):
             user_count_before = 0
 
-        # Inject request text using exact DOM interactions
-        esc_text = json.dumps(request_text)
-        await js(f"(()=>{{const e=document.querySelector('[contenteditable=true]');if(!e)return false;e.focus();e.innerHTML='';e.innerText={esc_text};e.dispatchEvent(new Event('input',{{bubbles:true}}));return true}})()")
-        await asyncio.sleep(1)
-        
-        # Click send and STRONGLY confirm delivery before waiting for the
-        # assistant turn. "Send button clicked" is NOT "message delivered": if
-        # the click lands while ChatGPT is still processing freshly-uploaded
-        # attachments, the send can be silently swallowed and the draft stays
-        # in the composer. The three-state delivery state machine lives in
-        # SendConfirmation (unit-tested); here we wire it to the live CDP js()
-        # helpers. See SendConfirmation for the full state model.
+        # ── Chat composer preflight + scoped injection (narrow relay safety fix) ──
+        # Before ANY DOM mutation, enumerate editable surfaces and select the
+        # single trustworthy chat composer (fail closed when 0 or >1). Inject
+        # only into the selected node, verify the text landed, and ROLL BACK to
+        # the pre-mutation content on verification failure so no orphan draft is
+        # left behind. The send control is bound to the same trustworthy
+        # composer container/form. See ChatComposerTarget /
+        # select_trustworthy_chat_composer.
         send_confirm_timeout = getattr(args, "send_confirm_timeout", SEND_CONFIRM_TIMEOUT)
         send_pending_timeout = getattr(args, "send_pending_timeout", SEND_PENDING_TIMEOUT)
 
+        composer_target = ChatComposerTarget(js)
+        resolved, target, reason = await composer_target.resolve()
+        if not resolved:
+            print(f"Error: RELAY_TARGET_FAIL_CLOSED: {reason}. "
+                  f"Refusing to mutate any composer.")
+            return 1
+
+        ok, _pre = await composer_target.inject(target, request_text)
+        if not ok:
+            print("Error: RELAY_INJECT_FAILED: could not write to the selected "
+                  "composer. Refusing to send (no mutation left behind).")
+            return 1
+
+        await asyncio.sleep(0.5)  # let the input event settle before verifying
+        if not await composer_target.verify(target, request_text):
+            print("Error: RELAY_INJECT_VERIFY_FAILED: injected text not present in "
+                  "the selected composer. Rolling back to pre-mutation content; "
+                  "no orphan draft left behind.")
+            await composer_target.rollback(target)
+            return 1
+
+        node_css = target["node_css"]
+
         async def _click_send():
-            return await js("(()=>{const b=document.querySelector('button[data-testid=\\'send-button\\']'); if(b && !b.disabled){b.click(); return true;} return false;})()")
+            # Re-preflight before EACH send (PO: dynamic DOM reorder -> fail
+            # closed, no complex auto-recovery). Scope the click to the send
+            # control bound to the trustworthy composer container/form.
+            return await composer_target.click_send()
 
         async def _composer_cleared():
-            return bool(await js("(()=>{const e=document.querySelector('[contenteditable=true]');return !e || ((e.innerText||'').trim().length===0);})()"))
+            # Scoped to the selected composer node (no first-match heuristic).
+            return await composer_target.is_cleared(node_css)
 
         async def _turn_counts():
             n = await js("(()=>{const r=document.querySelectorAll('[data-message-author-role]');let u=0,a=0;r.forEach(x=>{const v=x.getAttribute('data-message-author-role');if(v==='user')u++;else if(v==='assistant')a++;});return JSON.stringify({u:u,a:a});})()")
