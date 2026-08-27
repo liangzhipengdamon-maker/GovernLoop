@@ -463,6 +463,33 @@ class TestTwoPhaseModel(unittest.TestCase):
         self.assertEqual(fake.clicked_css, ["#send-ta"])
         self.assertEqual(fake.nodes["#ta"], "CHECKPOINT TEXT")
 
+    def test_phase_b_preflight_pass_but_click_unavailable_rollback_fail_closed(self):
+        # Phase B preflight PASS (the re-enumerated surfaces advertise a trusted
+        # send control), but at the instant of the click the control is gone or
+        # disabled -> CLICK_SEND_JS returns false -> NO click, the checkpoint is
+        # rolled back, and the composer is restored to its pre-mutation content.
+        async def scenario(send_present, send_enabled):
+            fake = FakeBrowser([chat_surface(node_css="#chat-0", has_send=False,
+                                             send_enabled=False, send_css=None)])
+            target = nr.ChatComposerTarget(fake.js)
+            ok, t, _ = await target.resolve()
+            self.assertTrue(ok)  # Phase A: empty composer without send is valid
+            ok2, _pre = await target.inject(t, "CHECKPOINT TEXT")
+            self.assertTrue(ok2)
+            self.assertTrue(await target.verify(t, "CHECKPOINT TEXT"))
+            # Phase B re-enumerates: a trusted send control is visible + enabled.
+            fake._surfaces = json.dumps([chat_surface(node_css="#chat-0", has_send=True,
+                                                      send_enabled=True, send_css="#send-0")])
+            # ...but between preflight and the click it vanishes / goes disabled.
+            fake.send_present = send_present
+            fake.send_enabled = send_enabled
+            self.assertFalse(await target.click_send(expected_target=t))
+            self.assertEqual(fake.clicks, 0)  # NO click dispatched
+            self.assertEqual(fake.nodes.get("#chat-0", ""), "")  # rollback, no orphan draft
+
+        asyncio.run(scenario(send_present=False, send_enabled=True))  # disappeared
+        asyncio.run(scenario(send_present=True, send_enabled=False))  # disabled
+
 
 def await_wrap(coro):
     return asyncio.run(coro)

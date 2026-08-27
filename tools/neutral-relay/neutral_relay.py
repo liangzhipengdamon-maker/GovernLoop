@@ -721,7 +721,8 @@ class ChatComposerTarget:
         click the send control bound to that same composer container/form. The
         send control must be a real send control (voice/dictation excluded) and
         enabled. Any identity mismatch, target disappearance, reorder ambiguity,
-        absent/disabled send control, or voice-only control fails closed: the
+        absent/disabled send control, voice-only control, OR a send control that
+        vanishes / goes disabled at the instant of the click fails closed: the
         checkpoint is rolled back and NO click is dispatched (no complex
         auto-recovery)."""
         if expected_target is None:
@@ -734,7 +735,18 @@ class ChatComposerTarget:
                   f"no click.")
             await self.rollback(expected_target)
             return False
-        return await self._click(send_css)
+        clicked = await self._click(send_css)
+        if not clicked:
+            # The preflight proved the send control a moment earlier, but the
+            # click itself did not dispatch (button disappeared / became
+            # disabled in between). The injected checkpoint must not be left in
+            # the composer: roll back to the exact pre-mutation content.
+            print("RELAY_TARGET_DRIFT: send control unavailable at click instant "
+                  "(disappeared or disabled after preflight); rolling back "
+                  "checkpoint, no click dispatched.")
+            await self.rollback(expected_target)
+            return False
+        return True
 
     async def _read(self, node_css):
         return await self.js(READ_NODE_JS % _js_str(node_css)) or ""
