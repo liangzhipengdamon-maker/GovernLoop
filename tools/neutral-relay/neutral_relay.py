@@ -634,6 +634,51 @@ def _same_target(a, b):
     return True
 
 
+# ── Canonical fail-closed status vocabulary ──────────────────────────────────
+# Public, machine-discoverable relay statuses. The detailed `reason` strings
+# (e.g. no-trustworthy-chat-composer, send-preflight-*) remain as the secondary
+# diagnostic; these canonical tokens are what a checkpoint session / CI can
+# assert on. The relay NEVER claims success unless the intended ChatGPT
+# composer is positively identified AND the send is confirmed (fail closed).
+STATUS_TARGET_NOT_CONFIRMED = "TARGET_NOT_CONFIRMED"            # composer identity ambiguous/absent before injection
+STATUS_INJECTION_NOT_CONFIRMED = "INJECTION_NOT_CONFIRMED"      # intended composer identified but text not written/verified
+STATUS_DELIVERY_CONFIRMED = "DELIVERY_CONFIRMED"                # composer cleared + user turn +1 (or auxiliary evidence)
+# Evidence discriminator: NOT_SENT vs POSSIBLY_SENT_UNCONFIRMED.
+STATUS_NOT_SENT = "NOT_SENT"                                    # zero mutation / rolled back / draft still present
+STATUS_POSSIBLY_SENT_UNCONFIRMED = "POSSIBLY_SENT_UNCONFIRMED"  # composer cleared but thread not yet confirmed
+
+
+def relay_injection_status(resolved, resolve_reason, injected, verified):
+    """Pure mapping from the Phase-A injection decision to a canonical token.
+
+    Returns one of the canonical tokens, or None when the relay should proceed
+    to Phase B (composer positively identified AND text written AND verified).
+    Deterministic and browser-free so it is unit-testable.
+    """
+    if not resolved:
+        return STATUS_TARGET_NOT_CONFIRMED
+    if not injected or not verified:
+        return STATUS_INJECTION_NOT_CONFIRMED
+    return None
+
+
+def delivery_canonical_status(send_status):
+    """Map a SendConfirmation status to the public canonical token.
+
+    The DELIVERY_CONFIRMED_* family collapses to DELIVERY_CONFIRMED. The
+    ambiguous SEND_PENDING_TIMEOUT (composer cleared, thread unconfirmed) is the
+    only POSSIBLY_SENT_UNCONFIRMED evidence; SEND_NOT_CONFIRMED /
+    SEND_BUTTON_UNAVAILABLE mean the draft never left the composer -> NOT_SENT.
+    This preserves the distinction between "not sent" and "possibly injected but
+    unconfirmed".
+    """
+    if send_status and send_status.startswith("DELIVERY_CONFIRMED"):
+        return STATUS_DELIVERY_CONFIRMED
+    if send_status == "SEND_PENDING_TIMEOUT":
+        return STATUS_POSSIBLY_SENT_UNCONFIRMED
+    return STATUS_NOT_SENT
+
+
 class ChatComposerTarget:
     """Preflight + scoped injection/verification/rollback for the chat composer.
 
@@ -984,21 +1029,25 @@ async def run_relay(args):
         composer_target = ChatComposerTarget(js)
         resolved, target, reason = await composer_target.resolve()
         if not resolved:
-            print(f"Error: RELAY_TARGET_FAIL_CLOSED: {reason}. "
+            # Composer identity not positively confirmed -> fail closed, zero
+            # mutation. Surface the canonical token (detailed reason kept).
+            print(f"Error: {STATUS_TARGET_NOT_CONFIRMED} ({reason}). "
                   f"Refusing to mutate any composer.")
             return 1
 
         ok, _pre = await composer_target.inject(target, request_text)
         if not ok:
-            print("Error: RELAY_INJECT_FAILED: could not write to the selected "
-                  "composer. Refusing to send (no mutation left behind).")
+            print(f"Error: {STATUS_INJECTION_NOT_CONFIRMED} (write-failed). "
+                  f"Refusing to send; {STATUS_NOT_SENT} (no mutation left behind).")
             return 1
 
         await asyncio.sleep(0.5)  # let the input event settle before verifying
         if not await composer_target.verify(target, request_text):
-            print("Error: RELAY_INJECT_VERIFY_FAILED: injected text not present in "
-                  "the selected composer. Rolling back to pre-mutation content; "
-                  "no orphan draft left behind.")
+            # Intended composer was identified, but the injected text could not
+            # be verified in it -> roll back so no orphan draft remains.
+            print(f"Error: {STATUS_INJECTION_NOT_CONFIRMED} (verify-failed: text not "
+                  f"present in selected composer). Rolling back to pre-mutation "
+                  f"content; {STATUS_NOT_SENT}, no orphan draft left behind.")
             await composer_target.rollback(target)
             return 1
 
@@ -1087,9 +1136,16 @@ async def run_relay(args):
         )
         delivered, _primary, send_status = await confirmation.confirm(user_count_before)
         if not delivered:
-            # SEND_BUTTON_UNAVAILABLE / SEND_NOT_CONFIRMED / SEND_PENDING_TIMEOUT
-            # (state machine already printed the detailed reason).
+            # SEND_BUTTON_UNAVAILABLE / SEND_NOT_CONFIRMED / SEND_PENDING_TIMEOUT.
+            # The SendConfirmation state machine already printed the detailed
+            # reason. Surface the canonical evidence discriminator so a "not
+            # sent" outcome is distinguishable from "possibly injected but
+            # unconfirmed" (composer cleared, thread not yet confirmed). Never
+            # resend from here.
+            print(f"CHECKPOINT_NOT_DELIVERED: {delivery_canonical_status(send_status)} "
+                  f"({send_status}).")
             return 1
+        print(f"CHECKPOINT_DELIVERED: {STATUS_DELIVERY_CONFIRMED} ({send_status}).")
 
         # Poll for the assistant response following the user turn created by
         # this send. Correlation remains user-turn -> following Assistant turn.
