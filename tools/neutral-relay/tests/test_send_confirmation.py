@@ -385,6 +385,30 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
         self.assertFalse(delivered)
         self.assertEqual(status, "SEND_PENDING_TIMEOUT")
 
+    def test_request_identity_absence_after_observation_fails_closed(self):
+        snaps = [
+            {"requestUserMatches": 1, "requestUserId": "stable-message"},
+            {"requestUserMatches": 0, "requestUserId": None},
+            {"requestUserMatches": 1, "requestUserId": "stable-message"},
+        ]
+        fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snaps, "REQ-ABSENT", pending_timeout=3)
+        delivered, _primary, status = asyncio.run(conf.confirm(2))
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+
+    def test_request_identity_ambiguity_after_observation_fails_closed(self):
+        snaps = [
+            {"requestUserMatches": 1, "requestUserId": "stable-message"},
+            {"requestUserMatches": 2, "requestUserId": None},
+            {"requestUserMatches": 1, "requestUserId": "stable-message"},
+        ]
+        fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snaps, "REQ-AMBIGUOUS", pending_timeout=3)
+        delivered, _primary, status = asyncio.run(conf.confirm(2))
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+
     def test_pending_unrelated_assistant_message_does_not_reconcile(self):
         # safety boundary: an assistant reply WITHOUT our REVIEW_REQUEST_ID in
         # the thread's last user message must NOT count as delivery proof ->

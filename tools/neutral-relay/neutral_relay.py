@@ -400,7 +400,14 @@ class SendConfirmation:
             identity = snapshot.get("requestUserId")
         except (AttributeError, TypeError, ValueError):
             return False
-        if self._request_identity_invalid or matches != 1 or not identity:
+        if self._request_identity_invalid:
+            return False
+        if matches != 1 or not identity:
+            # Once an identity has been observed, disappearance or ambiguity
+            # is an identity failure, not a transient miss that may later
+            # recover to the old ID.
+            if self._observed_request_id is not None:
+                self._request_identity_invalid = True
             return False
         if identity in self.pre_send_request_ids:
             self._request_identity_invalid = True
