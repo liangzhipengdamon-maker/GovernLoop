@@ -358,6 +358,7 @@ class SendConfirmation:
         snapshot=None,
         req_id=None,
         pre_send_request_ids=None,
+        send_identity_snapshot=None,
     ):
         self.click_send = click_send
         self.composer_cleared = composer_cleared
@@ -368,7 +369,7 @@ class SendConfirmation:
         self.ui_transition_seconds = ui_transition_seconds
         self.sleep = sleep
         self.now = now
-        self.snapshot = snapshot
+        self.snapshot = send_identity_snapshot or snapshot
         self.req_id = req_id
         self.pre_send_request_ids = set(pre_send_request_ids or [])
         self._observed_request_id = None
@@ -1208,6 +1209,20 @@ async def run_relay(args):
         async def _assistant_streaming():
             return bool(await js("(()=>{let s=false;document.querySelectorAll('[data-message-author-role=\\'assistant\\']').forEach(x=>{if(x.matches('.streaming-animation')||x.querySelector('.streaming-animation')||x.getAttribute('data-is-streaming')==='true'||x.getAttribute('aria-busy')==='true')s=true;});const st=document.querySelector('button[data-testid=\\'stop-button\\'],button[data-testid=\\'stop-generation\\'],button[aria-label*=\\'Stop\\'],button[aria-label*=\\'停止\\']');return s||!!st;})()"))
 
+        async def _send_identity_snapshot():
+            """SEND-phase callback: prove the new request-correlated user ID."""
+            return await js("""(()=>{
+                const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
+                const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user');
+                const marker = 'REVIEW_REQUEST_ID: ' + %s;
+                const matches = users.filter(n => (n.innerText || n.textContent || '').split(/\\r?\\n/)
+                    .some(line => line.trim() === marker));
+                return {
+                    requestUserMatches:matches.length,
+                    requestUserId:matches.length === 1 ? matches[0].getAttribute('data-message-id') : null
+                };
+            })()""" % _js_str(req_id))
+
         async def _read_assistant_binding(user_message_id):
             """Bind only the role immediately following the confirmed user node."""
             return await js("""(()=>{
@@ -1227,7 +1242,7 @@ async def run_relay(args):
                 return JSON.stringify({status:'bound', userMessageId:id, assistantMessageId:assistantId});
             })()""" % _js_str(user_message_id))
 
-        async def _snapshot(user_message_id, assistant_message_id):
+        async def _response_snapshot(user_message_id, assistant_message_id):
             """Read only the exact confirmed user/assistant message identities."""
             return await js("""(()=>{
                 const userId = %s;
@@ -1241,7 +1256,14 @@ async def run_relay(args):
                 const assistant = assistants.length === 1 ? assistants[0] : null;
                 const userIndex = user ? roles.indexOf(user) : -1;
                 const assistantIndex = assistant ? roles.indexOf(assistant) : -1;
-                const identityValid = !!user && !!assistant && assistantIndex === userIndex + 1;
+                const turnContainer = assistant ? assistant.closest('[data-turn-id-container]') : null;
+                const containerAssistantIds = turnContainer ?
+                    [...turnContainer.querySelectorAll('[data-message-author-role="assistant"]')]
+                        .map(n => n.getAttribute('data-message-id')).filter(Boolean) : [];
+                const turnContainerValid = !!turnContainer &&
+                    containerAssistantIds.length === 1 && containerAssistantIds[0] === assistantId &&
+                    turnContainer.getAttribute('data-turn') === 'assistant';
+                const identityValid = !!user && !!assistant && assistantIndex === userIndex + 1 && turnContainerValid;
                 const text = assistant ? ((assistant.innerText || assistant.textContent || '').trim()) : '';
                 const stop = document.querySelector('button[data-testid="stop-button"], button[data-testid="stop-generation"], button[aria-label*="Stop"], button[aria-label*="停止"]');
                 const streaming = !!(assistant && (
@@ -1250,9 +1272,12 @@ async def run_relay(args):
                     assistant.getAttribute('data-is-streaming') === 'true' ||
                     assistant.getAttribute('aria-busy') === 'true'
                 ));
-                const copyRate = assistant && assistant.querySelector(
+                // The action bar is a sibling of the message node in the live
+                // ChatGPT DOM. Scope it to the uniquely attributed turn
+                // container, never to document or another assistant turn.
+                const copyRate = turnContainerValid && turnContainer.querySelector(
                     'button[aria-label*="Copy"], button[aria-label*="复制"], ' +
-                    '[data-testid*="copy"], [data-testid*="like"], [data-testid*="thumbs"], ' +
+                    '[data-testid*="copy"], [data-testid*="feedback"], [data-testid*="like"], [data-testid*="thumbs"], ' +
                     'button[aria-label*="评价"], button[aria-label*="点赞"], button[aria-label*="点踩"], ' +
                     'button[aria-label*="Like"], button[aria-label*="Thumbs"]'
                 );
@@ -1260,6 +1285,7 @@ async def run_relay(args):
                     userMessageId:userId,
                     assistantMessageId:assistantId,
                     assistantIdentityValid:identityValid,
+                    turnContainerValid:turnContainerValid,
                     text:text,
                     hasAssistant:identityValid,
                     softGenerating:(!!stop || streaming),
@@ -1277,7 +1303,7 @@ async def run_relay(args):
             assistant_streaming=_assistant_streaming,
             confirm_timeout=send_confirm_timeout,
             pending_timeout=send_pending_timeout,
-            snapshot=_snapshot,
+            send_identity_snapshot=_send_identity_snapshot,
             req_id=req_id,
             pre_send_request_ids=pre_send_request_ids,
         )
@@ -1337,7 +1363,7 @@ async def run_relay(args):
         )
         diag_path = args.output_file + ".diag.jsonl"
         while time.time() < deadline:
-            snapshot = await _snapshot(user_message_id, assistant_message_id)
+            snapshot = await _response_snapshot(user_message_id, assistant_message_id)
 
             complete, settled_text = completion.observe(
                 snapshot,
@@ -1352,7 +1378,7 @@ async def run_relay(args):
                 confirm_text = settled_text
                 for _ in range(CONFIRM_READS):
                     await asyncio.sleep(CONFIRM_INTERVAL_SECONDS)
-                    snap2 = await _snapshot(user_message_id, assistant_message_id)
+                    snap2 = await _response_snapshot(user_message_id, assistant_message_id)
                     c2, t2 = completion.observe(snap2, user_count_before, req_id)
                     if not c2:
                         confirmed = False
@@ -1372,7 +1398,7 @@ async def run_relay(args):
                         recovery_deadline = time.time() + RECOVERY_SECONDS
                         while time.time() < recovery_deadline:
                             await asyncio.sleep(2)
-                            t2 = str((await _snapshot(user_message_id, assistant_message_id)).get("text") or "").strip()
+                            t2 = str((await _response_snapshot(user_message_id, assistant_message_id)).get("text") or "").strip()
                             if t2 and not _looks_truncated(t2):
                                 final_text = t2
                                 diag_recovery = "recovered"
@@ -1397,9 +1423,9 @@ async def run_relay(args):
                     "text_len": len(final_text) if found_response else None,
                     "text_head": (final_text or "")[:200] if found_response else None,
                     "snapshot": {
-                        "stopPresent": bool((await _snapshot(user_message_id, assistant_message_id)).get("stopPresent")),
-                        "hasCopyRate": bool((await _snapshot(user_message_id, assistant_message_id)).get("hasCopyRate")),
-                        "visibilityState": (await _snapshot(user_message_id, assistant_message_id)).get("visibilityState"),
+                        "stopPresent": bool((await _response_snapshot(user_message_id, assistant_message_id)).get("stopPresent")),
+                        "hasCopyRate": bool((await _response_snapshot(user_message_id, assistant_message_id)).get("hasCopyRate")),
+                        "visibilityState": (await _response_snapshot(user_message_id, assistant_message_id)).get("visibilityState"),
                         "userMessageId": user_message_id,
                         "assistantMessageId": assistant_message_id,
                     },

@@ -269,6 +269,37 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
         )
         return conf
 
+    def test_send_confirmation_uses_zero_arg_send_snapshot_not_response_snapshot(self):
+        calls = []
+        async def send_identity_snapshot():
+            calls.append("send")
+            return {"requestUserMatches": 1, "requestUserId": "U123"}
+
+        async def response_snapshot(*_args):
+            raise AssertionError("response-phase snapshot must not be called during SEND")
+
+        fake = FakeSequenced(cleared=[True], users=[1] * 10, assistants=[0] * 10)
+        clock = VirtualClock()
+        conf = neutral_relay.SendConfirmation(
+            click_send=fake.click_send,
+            composer_cleared=fake.composer_cleared,
+            turn_counts=fake.turn_counts,
+            assistant_streaming=fake.assistant_streaming,
+            confirm_timeout=2,
+            pending_timeout=2,
+            ui_transition_seconds=0,
+            sleep=clock.tick,
+            now=clock,
+            snapshot=response_snapshot,
+            send_identity_snapshot=send_identity_snapshot,
+            req_id="REQ-IDENTITY",
+        )
+        delivered, _primary, status = asyncio.run(conf.confirm(1))
+        self.assertTrue(delivered)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertEqual(conf.confirmed_user_message_id, "U123")
+        self.assertEqual(calls, ["send", "send"])
+
     def test_pending_request_correlated_readback_reconciles(self):
         # composer cleared, no user-turn/assistant-count signal, but the
         # REQUEST-CORRELATED read-back is observed (REVIEW_REQUEST_ID in the
