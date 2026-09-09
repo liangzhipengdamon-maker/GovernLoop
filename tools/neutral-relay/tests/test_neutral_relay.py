@@ -258,6 +258,26 @@ class TestResponseCompletionTracker(unittest.TestCase):
         self.assertFalse(neutral_relay.validate_response_contract(
             base + "PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
 
+    def test_active_wait_expiry_enters_reconciliation_instead_of_failing(self):
+        self.assertEqual(
+            neutral_relay.response_wait_phase(99, 100, 200),
+            neutral_relay.STATE_ASSISTANT_CONFIRMED,
+        )
+        self.assertEqual(
+            neutral_relay.response_wait_phase(101, 100, 200),
+            neutral_relay.STATE_POST_COMPLETION_RECONCILIATION,
+        )
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        snap = self.snapshot("complete", user_id="U123", assistant_id="A456", identity_valid=True)
+        tracker.observe(snap, 0, "RID-1", now=101)
+        self.assertEqual(tracker.observe(snap, 0, "RID-1", now=101), (True, "complete"))
+
+    def test_hard_reconciliation_deadline_fails_closed(self):
+        self.assertIsNone(neutral_relay.response_wait_phase(200, 100, 200))
+
 
 class TestNeutralRelay(unittest.TestCase):
     def setUp(self):

@@ -38,6 +38,28 @@ CONFIRM_INTERVAL_SECONDS = 2.0
 # recovered (non-truncated) reply after detecting a truncated shape. Env-
 # tunable via GOVERLOOP_RECOVERY_SECONDS.
 RECOVERY_SECONDS = 15.0
+# Once the exact assistant turn is bound, expiry of the normal active wait is
+# only a phase transition. This separate hard ceiling prevents an unbounded
+# browser wait while allowing very slow GPT generations to reconcile.
+POST_COMPLETION_MAX_SECONDS = 900.0
+
+STATE_CREATED = "CREATED"
+STATE_SENT = "SENT"
+STATE_USER_CONFIRMED = "USER_CONFIRMED"
+STATE_ASSISTANT_CONFIRMED = "ASSISTANT_CONFIRMED"
+STATE_POST_COMPLETION_RECONCILIATION = "POST_COMPLETION_RECONCILIATION"
+STATE_RESPONSE_VALIDATED = "RESPONSE_VALIDATED"
+STATE_CANONICAL_WRITTEN = "CANONICAL_WRITTEN"
+STATE_DONE = "DONE"
+
+
+def response_wait_phase(now, active_deadline, hard_deadline):
+    """Return the bounded active or post-completion response phase."""
+    if now < active_deadline:
+        return STATE_ASSISTANT_CONFIRMED
+    if now < hard_deadline:
+        return STATE_POST_COMPLETION_RECONCILIATION
+    return None
 
 TRANSPORT_ENVELOPE_FIELDS = (
     "REVIEW_REQUEST_ID",
@@ -947,6 +969,7 @@ async def upload_attachments(uploader, paths):
 
 
 async def run_relay(args):
+    state = STATE_CREATED
     # 1. Read request file
     if not os.path.exists(args.request_file):
         print(f"Error: Request file {args.request_file} not found.")
@@ -1318,10 +1341,12 @@ async def run_relay(args):
             print(f"CHECKPOINT_NOT_DELIVERED: {delivery_canonical_status(send_status)} "
                   f"({send_status}).")
             return 1
+        state = STATE_SENT
         user_message_id = confirmation.confirmed_user_message_id
         if not user_message_id:
             print("CHECKPOINT_NOT_DELIVERED: DELIVERY_IDENTITY_MISSING (fail closed).")
             return 1
+        state = STATE_USER_CONFIRMED
         print(f"CHECKPOINT_DELIVERED: {STATUS_DELIVERY_CONFIRMED} ({send_status}).")
 
         # Poll for the assistant response following the user turn created by
@@ -1331,12 +1356,19 @@ async def run_relay(args):
         # streaming markers are only soft evidence because they may remain stale
         # after a visibly complete response. Soft markers therefore require a
         # longer stable-text settle window, but cannot block finalization forever.
-        deadline = time.time() + args.wait_timeout
+        active_deadline = time.time() + args.wait_timeout
+        try:
+            post_completion_max = float(os.environ.get(
+                "GOVERLOOP_POST_COMPLETION_MAX_SECONDS", POST_COMPLETION_MAX_SECONDS))
+        except (TypeError, ValueError):
+            post_completion_max = POST_COMPLETION_MAX_SECONDS
+        post_completion_max = max(1.0, post_completion_max)
+        hard_deadline = active_deadline + post_completion_max
         found_response = False
         final_text = ""
         diag_recovery = "n/a"
         assistant_message_id = None
-        while time.time() < deadline and assistant_message_id is None:
+        while time.time() < active_deadline and assistant_message_id is None:
             binding_raw = await _read_assistant_binding(user_message_id)
             try:
                 binding = json.loads(binding_raw or "{}")
@@ -1353,6 +1385,7 @@ async def run_relay(args):
             print("Error: Timed out waiting for the assistant turn immediately following "
                   "the confirmed user message identity.")
             return 1
+        state = STATE_ASSISTANT_CONFIRMED
         # B4 (F2): thresholds are env-tunable for safe rollback without code
         # changes; defaults moved to 8s / 4 reads (streaming-pause tolerance).
         completion = ResponseCompletionTracker(
@@ -1362,7 +1395,13 @@ async def run_relay(args):
             expected_assistant_message_id=assistant_message_id,
         )
         diag_path = args.output_file + ".diag.jsonl"
-        while time.time() < deadline:
+        phase = STATE_ASSISTANT_CONFIRMED
+        while response_wait_phase(time.time(), active_deadline, hard_deadline):
+            next_phase = response_wait_phase(time.time(), active_deadline, hard_deadline)
+            if next_phase == STATE_POST_COMPLETION_RECONCILIATION and phase != next_phase:
+                phase = next_phase
+                print("RESPONSE_WAIT_ACTIVE_DEADLINE_REACHED: entering "
+                      "POST_COMPLETION_RECONCILIATION for exact assistant identity.")
             snapshot = await _response_snapshot(user_message_id, assistant_message_id)
 
             complete, settled_text = completion.observe(
@@ -1386,6 +1425,7 @@ async def run_relay(args):
                     confirm_text = t2
                 if confirmed:
                     final_text = confirm_text
+                    phase = STATE_POST_COMPLETION_RECONCILIATION
                     # B4 auto-fallback (F6, system-initiated — no user consent,
                     # no waiting for a request): if the reply still looks
                     # truncated (e.g. an envelope JSON cut mid-string), the relay
@@ -1435,7 +1475,9 @@ async def run_relay(args):
             print(f"WARN: diagnostics write failed: {exc}")
 
         if not found_response:
-            print(f"Error: Timed out after {args.wait_timeout}s waiting for a new stable Assistant response to settle.")
+            print(f"Error: hard response reconciliation timeout after "
+                  f"{args.wait_timeout + post_completion_max:g}s waiting for the exact "
+                  "Assistant response to settle.")
             await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
             return 1
 
@@ -1443,10 +1485,13 @@ async def run_relay(args):
         if not valid:
             print(f"RESPONSE_CONTRACT_{contract_status}: refusing canonical response write")
             return 1
+        state = STATE_RESPONSE_VALIDATED
 
         with open(args.output_file, "w") as f:
             f.write(final_text)
 
+        state = STATE_CANONICAL_WRITTEN
+        state = STATE_DONE
         print(f"Success: Wrote response to {args.output_file}")
         return 0
 
