@@ -320,6 +320,7 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
         self.assertFalse(primary)
         self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
         self.assertEqual(fake.clicks, 1)
+        self.assertEqual(conf.confirmed_user_message_id, "message-request-1")
 
     def test_later_user_does_not_break_original_request_identity(self):
         req_id = "REQ-IDENTITY-2"

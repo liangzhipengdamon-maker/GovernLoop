@@ -12,8 +12,9 @@ import neutral_relay
 
 class TestResponseCompletionTracker(unittest.TestCase):
     def snapshot(self, text, *, user_count=2, last_user_text="RID-1", soft=False, has_assistant=True,
-                 has_copy_rate=True, stop_present=False):
-        return {
+                 has_copy_rate=True, stop_present=False, user_id=None, assistant_id=None,
+                 identity_valid=None):
+        result = {
             "userCount": user_count,
             "lastUserText": last_user_text,
             "text": text,
@@ -23,6 +24,11 @@ class TestResponseCompletionTracker(unittest.TestCase):
             "hasCopyRate": has_copy_rate,
             "stopPresent": stop_present,
         }
+        if user_id is not None or assistant_id is not None or identity_valid is not None:
+            result["userMessageId"] = user_id
+            result["assistantMessageId"] = assistant_id
+            result["assistantIdentityValid"] = identity_valid
+        return result
 
     # --- NORMAL stage (no soft markers) ---
 
@@ -169,6 +175,45 @@ class TestResponseCompletionTracker(unittest.TestCase):
                          (True, "RESPONSE_VALID"))
         self.assertFalse(neutral_relay.validate_response_contract("PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
         self.assertFalse(neutral_relay.validate_response_contract(text.replace("REPO: owner/repo", "REPO: other/repo"), rid, "S-1", "owner/repo")[0])
+        self.assertFalse(neutral_relay.validate_response_contract(
+            text + "\ntrailing text", rid, "S-1", "owner/repo")[0])
+
+    def test_identity_tracker_ignores_later_turns_and_uses_exact_assistant(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=2, normal_settle_seconds=1,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        snap = self.snapshot("answer", user_id="U123", assistant_id="A456", identity_valid=True)
+        self.assertEqual(tracker.observe(snap, 0, "RID-1", now=0), (False, ""))
+        self.assertEqual(tracker.observe(snap, 999, "RID-1", now=1), (True, "answer"))
+
+    def test_identity_drift_or_disappearance_is_permanent_fail_closed(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        valid = self.snapshot("answer", user_id="U123", assistant_id="A456", identity_valid=True)
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=0), (False, ""))
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=0), (True, "answer"))
+        drift = self.snapshot("answer", user_id="U123", assistant_id="A999", identity_valid=False)
+        self.assertEqual(tracker.observe(drift, 0, "RID-1", now=1), (False, ""))
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=2), (False, ""))
+
+    def test_old_copy_button_does_not_complete_current_assistant(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        old_bar = self.snapshot("answer", has_copy_rate=True, user_id="U123",
+                                assistant_id="A456", identity_valid=True)
+        old_bar["assistantMessageId"] = "A111"
+        self.assertEqual(tracker.observe(old_bar, 0, "RID-1", now=0), (False, ""))
+
+    def test_partial_or_non_final_end_marker_is_not_canonical(self):
+        rid = "RID-1"
+        base = f"REVIEW_REQUEST_ID: {rid}\nSESSION: S-1\nREPO: owner/repo\n"
+        self.assertFalse(neutral_relay.validate_response_contract(
+            base + "PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
 
 
 class TestNeutralRelay(unittest.TestCase):
