@@ -43,9 +43,14 @@ class VirtualClock:
         self._t += 1.0
 
 
-def make_confirmation(fake, *, confirm_timeout=10, pending_timeout=10):
+def make_confirmation(fake, *, confirm_timeout=10, pending_timeout=10, identity=False):
     """Real SendConfirmation wired to a FakeSequenced with a virtual clock."""
     clock = VirtualClock()
+    async def snapshot():
+        return {
+            "requestUserMatches": 1 if identity else 0,
+            "requestUserId": "new-request-message" if identity else None,
+        }
     conf = neutral_relay.SendConfirmation(
         click_send=fake.click_send,
         composer_cleared=fake.composer_cleared,
@@ -56,6 +61,8 @@ def make_confirmation(fake, *, confirm_timeout=10, pending_timeout=10):
         ui_transition_seconds=0.0,
         sleep=clock.tick,
         now=clock,
+        snapshot=snapshot,
+        req_id="TEST-REQ",
     )
     return conf, fake, clock
 
@@ -107,10 +114,10 @@ class TestSendConfirmation(unittest.TestCase):
             users=[9] * 10 + [10] * 10,
             assistants=[3] * 20,
         )
-        (delivered, primary, status), out, f = run(fake)
+        (delivered, primary, status), out, f = run(fake, identity=True)
         self.assertTrue(delivered)
-        self.assertTrue(primary)
-        self.assertEqual(status, "DELIVERY_CONFIRMED_PRIMARY")
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
         self.assertEqual(f.clicks, 2)  # exactly one safe re-click
         self.assertIn("SEND_DRAFT_STILL_PRESENT", out)
 
@@ -135,11 +142,10 @@ class TestSendConfirmation(unittest.TestCase):
             users=[9] * 5 + [10] * 20,
             assistants=[3] * 20,
         )
-        (delivered, primary, status), out, f = run(fake)
+        (delivered, primary, status), out, f = run(fake, identity=True)
         self.assertTrue(delivered)
-        self.assertTrue(primary)
-        self.assertEqual(status, "DELIVERY_CONFIRMED_PRIMARY")
-        self.assertIn("SEND_PENDING", out)
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
         self.assertEqual(f.clicks, 1)  # never re-clicked after composer cleared
 
     def test_pending_later_user_plus1_primary_pass(self):
@@ -149,11 +155,11 @@ class TestSendConfirmation(unittest.TestCase):
             users=[9, 9, 9, 10],
             assistants=[3] * 10,
         )
-        (delivered, primary, status), out, f = run(fake)
+        (delivered, primary, status), out, f = run(fake, identity=True)
         self.assertTrue(delivered)
-        self.assertTrue(primary)
-        self.assertEqual(status, "DELIVERY_CONFIRMED_PRIMARY")
-        self.assertIn("DELIVERY_CONFIRMED_PRIMARY: PASS", out)
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertIn("DELIVERY_CONFIRMED_RECONCILED: PASS", out)
 
     def test_pending_new_assistant_turn_no_prior_streaming_auxiliary(self):
         # 5) pending window: no user +1, but a NEW assistant turn appears and
@@ -164,11 +170,11 @@ class TestSendConfirmation(unittest.TestCase):
             assistants=[3, 3, 4],   # baseline 3, then a new turn -> 4
             streaming=False,
         )
-        (delivered, primary, status), out, f = run(fake)
+        (delivered, primary, status), out, f = run(fake, identity=True)
         self.assertTrue(delivered)
         self.assertFalse(primary)
-        self.assertEqual(status, "DELIVERY_CONFIRMED_AUXILIARY")
-        self.assertIn("DELIVERY_CONFIRMED_AUXILIARY: PASS", out)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertIn("DELIVERY_CONFIRMED_RECONCILED: PASS", out)
 
     def test_prior_assistant_streaming_rejects_auxiliary_signal(self):
         # 6) an assistant turn WAS streaming before the send -> the auxiliary
@@ -240,8 +246,14 @@ if __name__ == "__main__":
 class TestSendConfirmationReconciliation(TestSendConfirmation):
     """B1: request-correlated read-back reconciliation in SEND_PENDING."""
 
-    def _conf(self, fake, snap, req_id, pending_timeout=10):
+    def _conf(self, fake, snap, req_id, pending_timeout=10, pre_send_request_ids=None):
+        index = 0
         async def _snap():
+            nonlocal index
+            if isinstance(snap, list):
+                value = snap[min(index, len(snap) - 1)]
+                index += 1
+                return value
             return snap
         conf = neutral_relay.SendConfirmation(
             click_send=fake.click_send,
@@ -253,6 +265,7 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
             ui_transition_seconds=0.0,
             snapshot=_snap,
             req_id=req_id,
+            pre_send_request_ids=pre_send_request_ids,
         )
         return conf
 
@@ -265,6 +278,8 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
         snap = {
             "userCount": 9,
             "lastUserText": f"evidence.txt 文档 REVIEW_REQUEST_ID: {req_id} REPO: ws CHECKPOINT: BEFORE_DESTRUCTIVE_ACTION",
+            "requestUserMatches": 1,
+            "requestUserId": "new-request-message",
             "text": '{ "verdict": "BLOCK", "confidence": "high", "rationale": "ok", "required_fixes": [] }',
             "hasAssistant": True,
             "softGenerating": False,
@@ -341,6 +356,34 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
             self.assertFalse(delivered)
             self.assertEqual(status, "SEND_PENDING_TIMEOUT")
             self.assertEqual(fake.clicks, 1)
+
+    def test_preexisting_request_identity_cannot_confirm_new_delivery(self):
+        snap = {"requestUserMatches": 1, "requestUserId": "old-message"}
+        fake = FakeSequenced(cleared=[True], users=[3] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snap, "REQ-OLD", pending_timeout=2,
+                          pre_send_request_ids=["old-message"])
+        delivered, _primary, status = asyncio.run(conf.confirm(2))
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+
+    def test_user_count_increment_without_request_identity_stays_pending(self):
+        snap = {"requestUserMatches": 0, "requestUserId": None}
+        fake = FakeSequenced(cleared=[True], users=[3] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snap, "REQ-MISSING", pending_timeout=2)
+        delivered, _primary, status = asyncio.run(conf.confirm(2))
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+
+    def test_request_identity_drift_fails_closed(self):
+        snaps = [
+            {"requestUserMatches": 1, "requestUserId": "first-message"},
+            {"requestUserMatches": 1, "requestUserId": "second-message"},
+        ]
+        fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snaps, "REQ-DRIFT", pending_timeout=2)
+        delivered, _primary, status = asyncio.run(conf.confirm(2))
+        self.assertFalse(delivered)
+        self.assertEqual(status, "SEND_PENDING_TIMEOUT")
 
     def test_pending_unrelated_assistant_message_does_not_reconcile(self):
         # safety boundary: an assistant reply WITHOUT our REVIEW_REQUEST_ID in
