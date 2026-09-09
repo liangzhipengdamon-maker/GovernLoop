@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -37,6 +38,68 @@ CONFIRM_INTERVAL_SECONDS = 2.0
 # recovered (non-truncated) reply after detecting a truncated shape. Env-
 # tunable via GOVERLOOP_RECOVERY_SECONDS.
 RECOVERY_SECONDS = 15.0
+# Once the exact assistant turn is bound, expiry of the normal active wait is
+# only a phase transition. This separate hard ceiling prevents an unbounded
+# browser wait while allowing very slow GPT generations to reconcile.
+POST_COMPLETION_MAX_SECONDS = 900.0
+
+STATE_CREATED = "CREATED"
+STATE_SENT = "SENT"
+STATE_USER_CONFIRMED = "USER_CONFIRMED"
+STATE_ASSISTANT_CONFIRMED = "ASSISTANT_CONFIRMED"
+STATE_COMPLETION_UI_CONFIRMED = "COMPLETION_UI_CONFIRMED"
+STATE_POST_COMPLETION_RECONCILIATION = "POST_COMPLETION_RECONCILIATION"
+STATE_RESPONSE_VALIDATED = "RESPONSE_VALIDATED"
+STATE_CANONICAL_WRITTEN = "CANONICAL_WRITTEN"
+STATE_DONE = "DONE"
+
+
+def response_wait_phase(now, active_deadline, hard_deadline):
+    """Return the bounded active or post-completion response phase."""
+    if now < active_deadline:
+        return STATE_ASSISTANT_CONFIRMED
+    if now < hard_deadline:
+        return STATE_POST_COMPLETION_RECONCILIATION
+    return None
+
+TRANSPORT_ENVELOPE_FIELDS = (
+    "REVIEW_REQUEST_ID",
+    "REPO",
+    "CHECKPOINT",
+    "SESSION",
+)
+
+
+def parse_transport_envelope(request_text):
+    """Parse only the authoritative outer header and preserve the body.
+
+    The first blank line is the transport boundary emitted by
+    ``build_request``. Metadata-looking lines after that boundary are payload
+    content and must never affect routing or correlation. Duplicate required
+    fields in the header are rejected, including identical duplicates.
+    Returns ``(fields, body)`` or ``(None, None)`` on any malformed envelope.
+    """
+    if not isinstance(request_text, str):
+        return None, None
+    parts = re.split(r"\r?\n\r?\n", request_text, maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    header, body = parts
+    fields = {}
+    for line in header.split("\n"):
+        if not line.strip() or ":" not in line:
+            return None, None
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key not in TRANSPORT_ENVELOPE_FIELDS or key in fields:
+            return None, None
+        value = value.strip()
+        if not value:
+            return None, None
+        fields[key] = value
+    if any(field not in fields for field in TRANSPORT_ENVELOPE_FIELDS):
+        return None, None
+    return fields, body
 
 
 def _looks_truncated(text):
@@ -53,12 +116,46 @@ def _looks_truncated(text):
         return False
     return s.count("{") > s.count("}")
 
+
+def validate_response_contract(text, req_id, session=None, repo=None):
+    """Validate the generic, request-bound relay response envelope."""
+    if not isinstance(text, str) or not text.strip() or not req_id:
+        return False, "RESPONSE_CONTRACT_INCOMPLETE"
+    lines = {line.strip() for line in text.splitlines()}
+    if f"REVIEW_REQUEST_ID: {req_id}" not in lines and f"REVIEW_REQUEST_ID={req_id}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    if session and f"SESSION: {session}" not in lines and f"SESSION={session}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    if repo and f"REPO: {repo}" not in lines and f"REPO={repo}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    end_markers = {
+        f"END_REVIEW_RESPONSE: {req_id}",
+        f"END_REVIEW_RESPONSE={req_id}",
+    }
+    if not any(marker in lines for marker in end_markers):
+        return False, "RESPONSE_CONTRACT_INCOMPLETE"
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not non_empty_lines or non_empty_lines[-1] not in end_markers:
+        return False, "RESPONSE_CONTRACT_INCOMPLETE"
+    return True, "RESPONSE_VALID"
+
+
+def write_canonical_response(output_file, text, req_id, session=None, repo=None):
+    """Validate and write one exact response without an additional settle wait."""
+    valid, status = validate_response_contract(text, req_id, session, repo)
+    if not valid:
+        return False, status
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True, status
+
 # Strong delivery confirmation (see run_relay): "send button clicked" is NOT
 # "message delivered". A click that lands while ChatGPT is still processing
 # freshly-uploaded attachments can be silently swallowed, leaving the draft in
-# the composer. Delivery is confirmed only when BOTH signals hold:
-#   (1) composer content cleared, and
-#   (2) the thread's user-turn count increased by exactly 1.
+# the composer. Aggregate turn counts remain diagnostics only. Canonical
+# delivery confirmation requires a newly observed, request-correlated user
+# message identity that remains stable across observations, plus a cleared
+# composer.
 SEND_CONFIRM_TIMEOUT = 30         # seconds to wait for the two confirmation signals
 SEND_CONFIRM_MAX_ATTEMPTS = 2     # 1 initial click + 1 safe re-click (no re-upload / re-inject)
 SEND_UI_TRANSITION_SECONDS = 2.0  # wait after each click for the UI to transition
@@ -100,6 +197,8 @@ class ResponseCompletionTracker:
         normal_settle_seconds=NORMAL_SETTLE_SECONDS,
         conservative_stable_reads=CONSERVATIVE_STABLE_READS,
         conservative_settle_seconds=CONSERVATIVE_SETTLE_SECONDS,
+        expected_user_message_id=None,
+        expected_assistant_message_id=None,
     ):
         self.normal_stable_reads = normal_stable_reads
         self.normal_settle_seconds = normal_settle_seconds
@@ -108,6 +207,9 @@ class ResponseCompletionTracker:
         self.last_text = None
         self.stable_reads = 0
         self.stable_since = None
+        self.expected_user_message_id = expected_user_message_id
+        self.expected_assistant_message_id = expected_assistant_message_id
+        self.identity_invalid = False
 
     def reset(self):
         self.last_text = None
@@ -118,6 +220,19 @@ class ResponseCompletionTracker:
         now = time.monotonic() if now is None else now
         snapshot = snapshot if isinstance(snapshot, dict) else {}
 
+        if self.expected_user_message_id or self.expected_assistant_message_id:
+            identity_ok = (
+                bool(snapshot.get("assistantIdentityValid")) and
+                snapshot.get("userMessageId") == self.expected_user_message_id and
+                snapshot.get("assistantMessageId") == self.expected_assistant_message_id
+            )
+            if not identity_ok:
+                self.identity_invalid = True
+                self.reset()
+                return False, ""
+            if self.identity_invalid:
+                return False, ""
+
         try:
             user_count = int(snapshot.get("userCount") or 0)
         except (TypeError, ValueError):
@@ -127,10 +242,6 @@ class ResponseCompletionTracker:
         text = str(snapshot.get("text") or "").strip()
         has_assistant = bool(snapshot.get("hasAssistant"))
         soft_generating = bool(snapshot.get("softGenerating"))
-        try:
-            request_user_matches = int(snapshot.get("requestUserMatches") or 0)
-        except (TypeError, ValueError):
-            request_user_matches = 0
 
         # B4 hard completion gate (F1): ChatGPT renders the action bar (copy /
         # rate icons) only after it finalizes an assistant message, and removes
@@ -146,7 +257,13 @@ class ResponseCompletionTracker:
         # Correlation: this send must have produced a new user turn followed by
         # an assistant turn. The response itself is NOT required to echo
         # REVIEW_REQUEST_ID (supports generic transport).
-        if req_id and "requestUserMatches" in snapshot:
+        if self.expected_user_message_id or self.expected_assistant_message_id:
+            user_added = True
+        elif req_id and "requestUserMatches" in snapshot:
+            try:
+                request_user_matches = int(snapshot.get("requestUserMatches") or 0)
+            except (TypeError, ValueError):
+                request_user_matches = 0
             # Once the request-aware snapshot is available, do not fall back
             # to lastUserText: duplicate matches must remain ambiguous even
             # when one of them happens to be the last user node.
@@ -243,13 +360,12 @@ class SendConfirmation:
         confirm_timeout) -> the send was not accepted -> ONE safe re-click
         (never re-upload attachments or re-inject text -- duplicate risk) ->
         if the composer is still non-empty -> SEND_NOT_CONFIRMED (fail closed).
-      - Composer cleared + user turn unchanged -> SEND_PENDING: the message
-        left the composer but the thread has not confirmed it yet -> NEVER
-        re-click / re-upload / re-inject from this state -> within
-        pending_timeout, confirm via user-turn +1 (canonical, PRIMARY) or a NEW
-        assistant turn with no assistant streaming before the send (AUXILIARY)
-        -> timeout yields SEND_PENDING_TIMEOUT (no resend; manual verification).
-      - Composer cleared + user turn +1 -> DELIVERY_CONFIRMED_PRIMARY.
+      - Composer cleared + identity not yet visible -> SEND_PENDING: the
+        message left the composer but the thread has not confirmed it yet ->
+        NEVER re-click / re-upload / re-inject from this state -> within
+        pending_timeout, wait for the exact new request-correlated identity.
+        A count increment or unrelated assistant turn is never authority.
+        Timeout yields SEND_PENDING_TIMEOUT (no resend; manual verification).
 
     All CDP interaction is injected as async callables so the state machine is
     unit-testable without a live browser (same pattern as AttachmentUploader).
@@ -275,6 +391,7 @@ class SendConfirmation:
         snapshot=None,
         req_id=None,
         pre_send_request_ids=None,
+        send_identity_snapshot=None,
     ):
         self.click_send = click_send
         self.composer_cleared = composer_cleared
@@ -285,14 +402,20 @@ class SendConfirmation:
         self.ui_transition_seconds = ui_transition_seconds
         self.sleep = sleep
         self.now = now
-        self.snapshot = snapshot
+        self.snapshot = send_identity_snapshot or snapshot
         self.req_id = req_id
         self.pre_send_request_ids = set(pre_send_request_ids or [])
         self._observed_request_id = None
         self._request_identity_invalid = bool(self.pre_send_request_ids)
+        self.confirmed_user_message_id = None
 
     async def confirm(self, user_count_before):
-        """Run the state machine. Returns (delivered, primary, status)."""
+        """Run the state machine. Returns (delivered, primary, status).
+
+        On success, ``confirmed_user_message_id`` is the sole handoff from
+        SEND to response capture; callers must not rediscover the request by
+        scanning rendered message text.
+        """
         # Baselines for the auxiliary SEND_PENDING signal: a NEW assistant turn
         # appearing after our send proves server-side acceptance -- but only if
         # no assistant turn was actively streaming before the send (a late-
@@ -341,13 +464,10 @@ class SendConfirmation:
             print("SEND_PENDING: draft has left the composer; awaiting thread confirmation "
                   "(no auto re-click to avoid duplicate delivery).")
             user_now = assistant_now = 0
-            # B1 reconciliation: delivery may also be confirmed when the
-            # REQUEST-CORRELATED read-back is observed — our REVIEW_REQUEST_ID
-            # present in the thread's last user message AND the corresponding
-            # assistant reply read back (settled). This binds delivery proof to
-            # THIS request/turn; an unrelated new assistant message never counts
-            # (the tracker requires req_id in lastUserText + has_assistant +
-            # non-empty settled text).
+            # B1 reconciliation: delivery is confirmed only when the unique,
+            # newly-sent request-correlated user identity is observed and
+            # stable. Aggregate count changes and unrelated assistant turns are
+            # diagnostics, never delivery authority.
             completion = ResponseCompletionTracker()
             pending_deadline = self.now() + self.pending_timeout
             while self.now() < pending_deadline:
@@ -418,6 +538,7 @@ class SendConfirmation:
         if identity != self._observed_request_id:
             self._request_identity_invalid = True
             return False
+        self.confirmed_user_message_id = identity
         return True
 
 
@@ -859,6 +980,7 @@ async def upload_attachments(uploader, paths):
 
 
 async def run_relay(args):
+    state = STATE_CREATED
     # 1. Read request file
     if not os.path.exists(args.request_file):
         print(f"Error: Request file {args.request_file} not found.")
@@ -867,21 +989,14 @@ async def run_relay(args):
     with open(args.request_file, "r") as f:
         request_text = f.read()
 
-    # Extract REPO and REVIEW_REQUEST_ID for routing and anti-crosstalk
-    repo = None
-    req_id = None
-    for line in request_text.split('\n'):
-        if line.startswith("REPO:"):
-            repo = line.split("REPO:")[1].strip()
-        elif line.startswith("REVIEW_REQUEST_ID:"):
-            req_id = line.split("REVIEW_REQUEST_ID:")[1].strip()
-
-    if not repo:
-        print("Error: REPO field not found in request file. Fail closed.")
+    envelope, _body = parse_transport_envelope(request_text)
+    if envelope is None:
+        print("Error: malformed or incomplete transport envelope in request file. Fail closed.")
         return 1
-    if not req_id:
-        print("Error: REVIEW_REQUEST_ID field not found in request file. Fail closed.")
-        return 1
+    repo = envelope["REPO"]
+    req_id = envelope["REVIEW_REQUEST_ID"]
+    checkpoint = envelope["CHECKPOINT"]
+    session = envelope["SESSION"]
 
     # 2. Config Routing (Trusted routing only)
     config_file = args.config_file
@@ -919,10 +1034,12 @@ async def run_relay(args):
             f"REVIEW_REQUEST_ID: {req_id}\n"
             "VERDICT: PASS\n"
             f"REPO: {repo}\n"
+            f"SESSION: {session or ''}\n"
             "PR: mock\n"
             "HEAD: mock\n"
             "SUMMARY: Dry run test\n"
             "ACTIONS: None\n"
+            f"END_REVIEW_RESPONSE: {req_id}\n"
         )
         with open(args.output_file, "w") as f:
             f.write(mock_response)
@@ -1126,27 +1243,61 @@ async def run_relay(args):
         async def _assistant_streaming():
             return bool(await js("(()=>{let s=false;document.querySelectorAll('[data-message-author-role=\\'assistant\\']').forEach(x=>{if(x.matches('.streaming-animation')||x.querySelector('.streaming-animation')||x.getAttribute('data-is-streaming')==='true'||x.getAttribute('aria-busy')==='true')s=true;});const st=document.querySelector('button[data-testid=\\'stop-button\\'],button[data-testid=\\'stop-generation\\'],button[aria-label*=\\'Stop\\'],button[aria-label*=\\'停止\\']');return s||!!st;})()"))
 
-        async def _snapshot():
+        async def _send_identity_snapshot():
+            """SEND-phase callback: prove the new request-correlated user ID."""
             return await js("""(()=>{
                 const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
                 const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user');
                 const marker = 'REVIEW_REQUEST_ID: ' + %s;
-                const requestMatches = users.filter(n =>
-                    (n.innerText || n.textContent || '').split(/\\r?\\n/)
-                        .some(line => line.trim() === marker));
-                const requestUser = requestMatches.length === 1 ? requestMatches[0] : null;
-                const lastUser = users.length ? users[users.length - 1] : null;
-                const lastUserText = lastUser ? ((lastUser.innerText || lastUser.textContent || '').trim()) : '';
-                let assistant = null;
-                if (requestUser) {
-                    const idx = roles.indexOf(requestUser);
-                    for (let i = idx + 1; i < roles.length; i++) {
-                        if (roles[i].getAttribute('data-message-author-role') === 'assistant') {
-                            assistant = roles[i];
-                            break;
-                        }
-                    }
+                const matches = users.filter(n => (n.innerText || n.textContent || '').split(/\\r?\\n/)
+                    .some(line => line.trim() === marker));
+                return {
+                    requestUserMatches:matches.length,
+                    requestUserId:matches.length === 1 ? matches[0].getAttribute('data-message-id') : null
+                };
+            })()""" % _js_str(req_id))
+
+        async def _read_assistant_binding(user_message_id):
+            """Bind only the role immediately following the confirmed user node."""
+            return await js("""(()=>{
+                const id = %s;
+                const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
+                const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user' &&
+                    n.getAttribute('data-message-id') === id);
+                if (users.length !== 1) return JSON.stringify({status:'invalid-user'});
+                const user = users[0];
+                const index = roles.indexOf(user);
+                const next = roles[index + 1];
+                if (!next || next.getAttribute('data-message-author-role') !== 'assistant') {
+                    return JSON.stringify({status:'waiting', userMessageId:id});
                 }
+                const assistantId = next.getAttribute('data-message-id');
+                if (!assistantId) return JSON.stringify({status:'invalid-assistant'});
+                return JSON.stringify({status:'bound', userMessageId:id, assistantMessageId:assistantId});
+            })()""" % _js_str(user_message_id))
+
+        async def _response_snapshot(user_message_id, assistant_message_id):
+            """Read only the exact confirmed user/assistant message identities."""
+            return await js("""(()=>{
+                const userId = %s;
+                const assistantId = %s;
+                const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
+                const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user' &&
+                    n.getAttribute('data-message-id') === userId);
+                const assistants = roles.filter(n => n.getAttribute('data-message-author-role') === 'assistant' &&
+                    n.getAttribute('data-message-id') === assistantId);
+                const user = users.length === 1 ? users[0] : null;
+                const assistant = assistants.length === 1 ? assistants[0] : null;
+                const userIndex = user ? roles.indexOf(user) : -1;
+                const assistantIndex = assistant ? roles.indexOf(assistant) : -1;
+                const turnContainer = assistant ? assistant.closest('[data-turn-id-container]') : null;
+                const containerAssistantIds = turnContainer ?
+                    [...turnContainer.querySelectorAll('[data-message-author-role="assistant"]')]
+                        .map(n => n.getAttribute('data-message-id')).filter(Boolean) : [];
+                const turnContainerValid = !!turnContainer &&
+                    containerAssistantIds.length === 1 && containerAssistantIds[0] === assistantId &&
+                    turnContainer.getAttribute('data-turn') === 'assistant';
+                const identityValid = !!user && !!assistant && assistantIndex === userIndex + 1 && turnContainerValid;
                 const text = assistant ? ((assistant.innerText || assistant.textContent || '').trim()) : '';
                 const stop = document.querySelector('button[data-testid="stop-button"], button[data-testid="stop-generation"], button[aria-label*="Stop"], button[aria-label*="停止"]');
                 const streaming = !!(assistant && (
@@ -1155,30 +1306,29 @@ async def run_relay(args):
                     assistant.getAttribute('data-is-streaming') === 'true' ||
                     assistant.getAttribute('aria-busy') === 'true'
                 ));
-                // B4 (F1): ChatGPT renders the action bar (copy / rate icons)
-                // only after the message is finalized. Multi-selector fallback
-                // in case ChatGPT renames these controls.
-                const copyRate = document.querySelector(
+                // The action bar is a sibling of the message node in the live
+                // ChatGPT DOM. Scope it to the uniquely attributed turn
+                // container, never to document or another assistant turn.
+                const copyRate = turnContainerValid && turnContainer.querySelector(
                     'button[aria-label*="Copy"], button[aria-label*="复制"], ' +
-                    '[data-testid*="copy"], [data-testid*="like"], [data-testid*="thumbs"], ' +
+                    '[data-testid*="copy"], [data-testid*="feedback"], [data-testid*="like"], [data-testid*="thumbs"], ' +
                     'button[aria-label*="评价"], button[aria-label*="点赞"], button[aria-label*="点踩"], ' +
                     'button[aria-label*="Like"], button[aria-label*="Thumbs"]'
                 );
                 return {
-                    userCount:users.length,
-                    lastUserText:lastUserText,
-                    requestUserMatches:requestMatches.length,
-                    requestUserId:requestUser ? requestUser.getAttribute('data-message-id') : null,
-                    requestAssistantId:assistant ? assistant.getAttribute('data-message-id') : null,
+                    userMessageId:userId,
+                    assistantMessageId:assistantId,
+                    assistantIdentityValid:identityValid,
+                    turnContainerValid:turnContainerValid,
                     text:text,
-                    hasAssistant:!!assistant,
+                    hasAssistant:identityValid,
                     softGenerating:(!!stop || streaming),
                     stopPresent:!!stop,
                     streamingMarker:streaming,
                     hasCopyRate:!!copyRate,
                     visibilityState:document.visibilityState
                 };
-            })()""" % _js_str(req_id))
+            })()""" % (_js_str(user_message_id), _js_str(assistant_message_id)))
 
         confirmation = SendConfirmation(
             click_send=_click_send,
@@ -1187,7 +1337,7 @@ async def run_relay(args):
             assistant_streaming=_assistant_streaming,
             confirm_timeout=send_confirm_timeout,
             pending_timeout=send_pending_timeout,
-            snapshot=_snapshot,
+            send_identity_snapshot=_send_identity_snapshot,
             req_id=req_id,
             pre_send_request_ids=pre_send_request_ids,
         )
@@ -1202,6 +1352,12 @@ async def run_relay(args):
             print(f"CHECKPOINT_NOT_DELIVERED: {delivery_canonical_status(send_status)} "
                   f"({send_status}).")
             return 1
+        state = STATE_SENT
+        user_message_id = confirmation.confirmed_user_message_id
+        if not user_message_id:
+            print("CHECKPOINT_NOT_DELIVERED: DELIVERY_IDENTITY_MISSING (fail closed).")
+            return 1
+        state = STATE_USER_CONFIRMED
         print(f"CHECKPOINT_DELIVERED: {STATUS_DELIVERY_CONFIRMED} ({send_status}).")
 
         # Poll for the assistant response following the user turn created by
@@ -1211,19 +1367,53 @@ async def run_relay(args):
         # streaming markers are only soft evidence because they may remain stale
         # after a visibly complete response. Soft markers therefore require a
         # longer stable-text settle window, but cannot block finalization forever.
-        deadline = time.time() + args.wait_timeout
+        active_deadline = time.time() + args.wait_timeout
+        try:
+            post_completion_max = float(os.environ.get(
+                "GOVERLOOP_POST_COMPLETION_MAX_SECONDS", POST_COMPLETION_MAX_SECONDS))
+        except (TypeError, ValueError):
+            post_completion_max = POST_COMPLETION_MAX_SECONDS
+        post_completion_max = max(1.0, post_completion_max)
+        hard_deadline = active_deadline + post_completion_max
         found_response = False
         final_text = ""
         diag_recovery = "n/a"
+        assistant_message_id = None
+        while time.time() < active_deadline and assistant_message_id is None:
+            binding_raw = await _read_assistant_binding(user_message_id)
+            try:
+                binding = json.loads(binding_raw or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                binding = {}
+            if binding.get("status") == "bound":
+                assistant_message_id = binding.get("assistantMessageId")
+                if binding.get("userMessageId") != user_message_id:
+                    assistant_message_id = None
+                    break
+                break
+            await asyncio.sleep(1)
+        if not assistant_message_id:
+            print("Error: Timed out waiting for the assistant turn immediately following "
+                  "the confirmed user message identity.")
+            return 1
+        state = STATE_ASSISTANT_CONFIRMED
         # B4 (F2): thresholds are env-tunable for safe rollback without code
         # changes; defaults moved to 8s / 4 reads (streaming-pause tolerance).
         completion = ResponseCompletionTracker(
             normal_stable_reads=int(os.environ.get("GOVERLOOP_STABLE_READS", NORMAL_STABLE_READS)),
             normal_settle_seconds=float(os.environ.get("GOVERLOOP_SETTLE_SECONDS", NORMAL_SETTLE_SECONDS)),
+            expected_user_message_id=user_message_id,
+            expected_assistant_message_id=assistant_message_id,
         )
         diag_path = args.output_file + ".diag.jsonl"
-        while time.time() < deadline:
-            snapshot = await _snapshot()
+        phase = STATE_ASSISTANT_CONFIRMED
+        while response_wait_phase(time.time(), active_deadline, hard_deadline):
+            next_phase = response_wait_phase(time.time(), active_deadline, hard_deadline)
+            if next_phase == STATE_POST_COMPLETION_RECONCILIATION and phase != next_phase:
+                phase = next_phase
+                print("RESPONSE_WAIT_ACTIVE_DEADLINE_REACHED: entering "
+                      "POST_COMPLETION_RECONCILIATION for exact assistant identity.")
+            snapshot = await _response_snapshot(user_message_id, assistant_message_id)
 
             complete, settled_text = completion.observe(
                 snapshot,
@@ -1231,43 +1421,22 @@ async def run_relay(args):
                 req_id=req_id,
             )
             if complete:
-                # B4 (F3): post-finalize confirmation — the same node must stay
-                # text-identical across CONFIRM_READS more reads before we write
-                # the response. A resumed stream cancels the finalize (revocable).
-                confirmed = True
-                confirm_text = settled_text
-                for _ in range(CONFIRM_READS):
-                    await asyncio.sleep(CONFIRM_INTERVAL_SECONDS)
-                    snap2 = await _snapshot()
-                    c2, t2 = completion.observe(snap2, user_count_before, req_id)
-                    if not c2:
-                        confirmed = False
-                        break
-                    confirm_text = t2
-                if confirmed:
-                    final_text = confirm_text
-                    # B4 auto-fallback (F6, system-initiated — no user consent,
-                    # no waiting for a request): if the reply still looks
-                    # truncated (e.g. an envelope JSON cut mid-string), the relay
-                    # proactively captures a token-free screenshot AND performs a
-                    # short recovery re-read of the same node. This is the
-                    # proactive remediation for GPT conversation truncation.
-                    if _looks_truncated(final_text):
-                        await _capture_screenshot(f"{req_id}-truncated")
-                        diag_recovery = "truncated-evidence"
-                        recovery_deadline = time.time() + RECOVERY_SECONDS
-                        while time.time() < recovery_deadline:
-                            await asyncio.sleep(2)
-                            t2 = str((await _snapshot()).get("text") or "").strip()
-                            if t2 and not _looks_truncated(t2):
-                                final_text = t2
-                                diag_recovery = "recovered"
-                                break
-                    else:
-                        diag_recovery = "none"
-                    found_response = True
-                    break
-                # else: text resumed -> keep waiting on the outer loop
+                # Exact scoped completion UI is the terminal signal. Write the
+                # exact stable text immediately; partial/correlated-invalid
+                # text is rejected by the unchanged contract gate below.
+                final_text = settled_text
+                phase = STATE_COMPLETION_UI_CONFIRMED
+                diag_recovery = "none"
+                valid, contract_status = write_canonical_response(
+                    args.output_file, final_text, req_id, session, repo)
+                if not valid:
+                    print(f"RESPONSE_CONTRACT_{contract_status}: refusing canonical response write")
+                    return 1
+                state = STATE_RESPONSE_VALIDATED
+                state = STATE_CANONICAL_WRITTEN
+                state = STATE_DONE
+                found_response = True
+                break
 
             await asyncio.sleep(2)
 
@@ -1283,10 +1452,11 @@ async def run_relay(args):
                     "text_len": len(final_text) if found_response else None,
                     "text_head": (final_text or "")[:200] if found_response else None,
                     "snapshot": {
-                        "stopPresent": bool((await _snapshot()).get("stopPresent")),
-                        "hasCopyRate": bool((await _snapshot()).get("hasCopyRate")),
-                        "visibilityState": (await _snapshot()).get("visibilityState"),
-                        "userCount": (await _snapshot()).get("userCount"),
+                        "stopPresent": bool((await _response_snapshot(user_message_id, assistant_message_id)).get("stopPresent")),
+                        "hasCopyRate": bool((await _response_snapshot(user_message_id, assistant_message_id)).get("hasCopyRate")),
+                        "visibilityState": (await _response_snapshot(user_message_id, assistant_message_id)).get("visibilityState"),
+                        "userMessageId": user_message_id,
+                        "assistantMessageId": assistant_message_id,
                     },
                     "sse_tail": list(sse_events) if sse_events is not None else None,
                 }, ensure_ascii=False) + "\n")
@@ -1294,12 +1464,11 @@ async def run_relay(args):
             print(f"WARN: diagnostics write failed: {exc}")
 
         if not found_response:
-            print(f"Error: Timed out after {args.wait_timeout}s waiting for a new stable Assistant response to settle.")
+            print(f"Error: hard response reconciliation timeout after "
+                  f"{args.wait_timeout + post_completion_max:g}s waiting for the exact "
+                  "Assistant response to settle.")
             await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
             return 1
-
-        with open(args.output_file, "w") as f:
-            f.write(final_text)
 
         print(f"Success: Wrote response to {args.output_file}")
         return 0

@@ -328,7 +328,9 @@ def build_request(state, ctype, message, seq):
         f"SESSION: {state['session_id']}\n\n"
     )
     body = message if (message or "").strip() else f"Checkpoint {ctype} for session {state['session_id']}."
-    return head + body.strip()
+    return (head + body.strip() + "\n\n"
+            "Return the complete response and finish with this exact line:\n"
+            f"END_REVIEW_RESPONSE: {state['session_id']}-{ctype}-{seq}")
 
 
 def relay_supports_attachment(relay):

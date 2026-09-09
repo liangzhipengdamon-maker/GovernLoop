@@ -10,10 +10,54 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import neutral_relay
 
 
+class TestTransportEnvelope(unittest.TestCase):
+    def envelope(self, body="payload"):
+        return ("REVIEW_REQUEST_ID: OUTER\nREPO: owner/outer\n"
+                "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-OUTER\n\n" + body)
+
+    def test_body_metadata_cannot_overwrite_authoritative_header(self):
+        fields, body = neutral_relay.parse_transport_envelope(self.envelope(
+            "REVIEW_REQUEST_ID: INNER\nREPO: owner/inner\nSESSION: S-INNER"))
+        self.assertEqual(fields, {
+            "REVIEW_REQUEST_ID": "OUTER", "REPO": "owner/outer",
+            "CHECKPOINT": "REVIEW_REQUIRED", "SESSION": "S-OUTER",
+        })
+        self.assertEqual(body, "REVIEW_REQUEST_ID: INNER\nREPO: owner/inner\nSESSION: S-INNER")
+
+    def test_duplicate_or_conflicting_header_fields_fail_closed(self):
+        duplicate = self.envelope().replace(
+            "REPO: owner/outer\n", "REPO: owner/outer\nREVIEW_REQUEST_ID: OTHER\n")
+        self.assertEqual(neutral_relay.parse_transport_envelope(duplicate), (None, None))
+        conflicting = self.envelope().replace("SESSION: S-OUTER", "SESSION: S-ONE\nSESSION: S-TWO")
+        self.assertEqual(neutral_relay.parse_transport_envelope(conflicting), (None, None))
+
+    def test_missing_checkpoint_fails_closed(self):
+        missing = self.envelope().replace("CHECKPOINT: REVIEW_REQUIRED\n", "")
+        self.assertEqual(neutral_relay.parse_transport_envelope(missing), (None, None))
+
+    def test_build_request_header_round_trips_exactly(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                            "skills", "workbuddy", "governloop", "scripts", "governloop_session.py")
+        spec = importlib.util.spec_from_file_location("governloop_session_for_envelope", path)
+        session = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(session)
+        state = {"session_id": "S-1", "repo": "owner/repo"}
+        generated = session.build_request(state, "REVIEW_REQUIRED", "body", 7)
+        fields, body = neutral_relay.parse_transport_envelope(generated)
+        self.assertEqual(fields, {
+            "REVIEW_REQUEST_ID": "S-1-REVIEW_REQUIRED-7",
+            "REPO": "owner/repo", "CHECKPOINT": "REVIEW_REQUIRED", "SESSION": "S-1",
+        })
+        self.assertEqual(body, "body\n\nReturn the complete response and finish with this exact line:\n"
+                         "END_REVIEW_RESPONSE: S-1-REVIEW_REQUIRED-7")
+
+
 class TestResponseCompletionTracker(unittest.TestCase):
     def snapshot(self, text, *, user_count=2, last_user_text="RID-1", soft=False, has_assistant=True,
-                 has_copy_rate=True, stop_present=False):
-        return {
+                 has_copy_rate=True, stop_present=False, user_id=None, assistant_id=None,
+                 identity_valid=None):
+        result = {
             "userCount": user_count,
             "lastUserText": last_user_text,
             "text": text,
@@ -23,6 +67,11 @@ class TestResponseCompletionTracker(unittest.TestCase):
             "hasCopyRate": has_copy_rate,
             "stopPresent": stop_present,
         }
+        if user_id is not None or assistant_id is not None or identity_valid is not None:
+            result["userMessageId"] = user_id
+            result["assistantMessageId"] = assistant_id
+            result["assistantIdentityValid"] = identity_valid
+        return result
 
     # --- NORMAL stage (no soft markers) ---
 
@@ -161,6 +210,85 @@ class TestResponseCompletionTracker(unittest.TestCase):
         for now in (0, 2, 4, 6, 8, 16):
             self.assertEqual(tracker.observe(snap, 1, "RID-1", now=now), (False, ""))
 
+    def test_response_contract_requires_correlations_and_end_marker(self):
+        rid = "RID-1"
+        text = (f"REVIEW_REQUEST_ID: {rid}\nSESSION: S-1\nREPO: owner/repo\n"
+                f"END_REVIEW_RESPONSE: {rid}")
+        self.assertEqual(neutral_relay.validate_response_contract(text, rid, "S-1", "owner/repo"),
+                         (True, "RESPONSE_VALID"))
+        self.assertFalse(neutral_relay.validate_response_contract("PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
+        self.assertFalse(neutral_relay.validate_response_contract(text.replace("REPO: owner/repo", "REPO: other/repo"), rid, "S-1", "owner/repo")[0])
+        self.assertFalse(neutral_relay.validate_response_contract(
+            text + "\ntrailing text", rid, "S-1", "owner/repo")[0])
+
+    def test_identity_tracker_ignores_later_turns_and_uses_exact_assistant(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=2, normal_settle_seconds=1,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        snap = self.snapshot("answer", user_id="U123", assistant_id="A456", identity_valid=True)
+        self.assertEqual(tracker.observe(snap, 0, "RID-1", now=0), (False, ""))
+        self.assertEqual(tracker.observe(snap, 999, "RID-1", now=1), (True, "answer"))
+
+    def test_identity_drift_or_disappearance_is_permanent_fail_closed(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        valid = self.snapshot("answer", user_id="U123", assistant_id="A456", identity_valid=True)
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=0), (False, ""))
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=0), (True, "answer"))
+        drift = self.snapshot("answer", user_id="U123", assistant_id="A999", identity_valid=False)
+        self.assertEqual(tracker.observe(drift, 0, "RID-1", now=1), (False, ""))
+        self.assertEqual(tracker.observe(valid, 0, "RID-1", now=2), (False, ""))
+
+    def test_old_copy_button_does_not_complete_current_assistant(self):
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        old_bar = self.snapshot("answer", has_copy_rate=True, user_id="U123",
+                                assistant_id="A456", identity_valid=True)
+        old_bar["assistantMessageId"] = "A111"
+        self.assertEqual(tracker.observe(old_bar, 0, "RID-1", now=0), (False, ""))
+
+    def test_partial_or_non_final_end_marker_is_not_canonical(self):
+        rid = "RID-1"
+        base = f"REVIEW_REQUEST_ID: {rid}\nSESSION: S-1\nREPO: owner/repo\n"
+        self.assertFalse(neutral_relay.validate_response_contract(
+            base + "PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
+
+    def test_active_wait_expiry_enters_reconciliation_instead_of_failing(self):
+        self.assertEqual(
+            neutral_relay.response_wait_phase(99, 100, 200),
+            neutral_relay.STATE_ASSISTANT_CONFIRMED,
+        )
+        self.assertEqual(
+            neutral_relay.response_wait_phase(101, 100, 200),
+            neutral_relay.STATE_POST_COMPLETION_RECONCILIATION,
+        )
+        tracker = neutral_relay.ResponseCompletionTracker(
+            normal_stable_reads=1, normal_settle_seconds=0,
+            expected_user_message_id="U123", expected_assistant_message_id="A456",
+        )
+        snap = self.snapshot("complete", user_id="U123", assistant_id="A456", identity_valid=True)
+        tracker.observe(snap, 0, "RID-1", now=101)
+        self.assertEqual(tracker.observe(snap, 0, "RID-1", now=101), (True, "complete"))
+
+    def test_hard_reconciliation_deadline_fails_closed(self):
+        self.assertIsNone(neutral_relay.response_wait_phase(200, 100, 200))
+
+    def test_completion_ui_candidate_writes_canonical_response_immediately(self):
+        rid = "RID-T100"
+        text = f"REVIEW_REQUEST_ID: {rid}\nEND_REVIEW_RESPONSE: {rid}"
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "response.md")
+            ok, status = neutral_relay.write_canonical_response(path, text, rid)
+            self.assertTrue(ok)
+            self.assertEqual(status, "RESPONSE_VALID")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+
 
 class TestNeutralRelay(unittest.TestCase):
     def setUp(self):
@@ -205,7 +333,8 @@ class TestNeutralRelay(unittest.TestCase):
     def test_repo_route_parsing_and_dry_run(self):
         # Setup valid request
         with open(self.req_path, "w") as f:
-            f.write("REVIEW_REQUEST_ID: 12345\nREPO: test/repo\nPR: 1\nHEAD: abc\n")
+            f.write("REVIEW_REQUEST_ID: 12345\nREPO: test/repo\n"
+                    "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-1\n\nPR: 1\nHEAD: abc\n")
 
         # An explicit --config-file equivalent must continue to override the default.
         args = self.Args(self.req_path, self.out_path, self.config_path, dry_run=True)
@@ -219,7 +348,8 @@ class TestNeutralRelay(unittest.TestCase):
 
     def test_unknown_repo_fails_closed(self):
         with open(self.req_path, "w") as f:
-            f.write("REVIEW_REQUEST_ID: 12345\nREPO: unknown/repo\nPR: 1\nHEAD: abc\n")
+            f.write("REVIEW_REQUEST_ID: 12345\nREPO: unknown/repo\n"
+                    "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-1\n\nPR: 1\nHEAD: abc\n")
 
         args = self.Args(self.req_path, self.out_path, self.config_path, dry_run=True)
         ret = asyncio.run(neutral_relay.run_relay(args))
