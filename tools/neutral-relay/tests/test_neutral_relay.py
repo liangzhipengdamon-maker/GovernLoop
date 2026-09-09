@@ -153,6 +153,14 @@ class TestResponseCompletionTracker(unittest.TestCase):
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=6), (False, ""))
         self.assertEqual(tracker.observe(snap, 1, "RID-1", now=8), (True, "VERDICT: PASS"))
 
+    def test_ambiguous_request_matches_do_not_correlate_from_last_user_text(self):
+        tracker = neutral_relay.ResponseCompletionTracker()
+        snap = self.snapshot("VERDICT: PASS", user_count=1, last_user_text="RID-1")
+        snap["requestUserMatches"] = 2
+        snap["requestUserId"] = None
+        for now in (0, 2, 4, 6, 8, 16):
+            self.assertEqual(tracker.observe(snap, 1, "RID-1", now=now), (False, ""))
+
 
 class TestNeutralRelay(unittest.TestCase):
     def setUp(self):
