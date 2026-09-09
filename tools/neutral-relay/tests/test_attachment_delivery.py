@@ -183,7 +183,8 @@ class TestSessionLevelRouting(unittest.TestCase):
         self.out = os.path.join(self.temp_dir.name, "out.md")
         self.cfg = os.path.join(self.temp_dir.name, "config.json")
         with open(self.req, "w") as f:
-            f.write("REVIEW_REQUEST_ID: RID-1\nREPO: owner/repo\n\nhello\n")
+            f.write("REVIEW_REQUEST_ID: RID-1\nREPO: owner/repo\n"
+                    "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-1\n\nhello\n")
         json.dump({
             "routes": {
                 "owner/repo": {

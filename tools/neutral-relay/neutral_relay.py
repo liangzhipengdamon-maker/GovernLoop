@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -37,6 +38,45 @@ CONFIRM_INTERVAL_SECONDS = 2.0
 # recovered (non-truncated) reply after detecting a truncated shape. Env-
 # tunable via GOVERLOOP_RECOVERY_SECONDS.
 RECOVERY_SECONDS = 15.0
+
+TRANSPORT_ENVELOPE_FIELDS = (
+    "REVIEW_REQUEST_ID",
+    "REPO",
+    "CHECKPOINT",
+    "SESSION",
+)
+
+
+def parse_transport_envelope(request_text):
+    """Parse only the authoritative outer header and preserve the body.
+
+    The first blank line is the transport boundary emitted by
+    ``build_request``. Metadata-looking lines after that boundary are payload
+    content and must never affect routing or correlation. Duplicate required
+    fields in the header are rejected, including identical duplicates.
+    Returns ``(fields, body)`` or ``(None, None)`` on any malformed envelope.
+    """
+    if not isinstance(request_text, str):
+        return None, None
+    parts = re.split(r"\r?\n\r?\n", request_text, maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    header, body = parts
+    fields = {}
+    for line in header.split("\n"):
+        if not line.strip() or ":" not in line:
+            return None, None
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key not in TRANSPORT_ENVELOPE_FIELDS or key in fields:
+            return None, None
+        value = value.strip()
+        if not value:
+            return None, None
+        fields[key] = value
+    if any(field not in fields for field in TRANSPORT_ENVELOPE_FIELDS):
+        return None, None
+    return fields, body
 
 
 def _looks_truncated(text):
@@ -914,24 +954,14 @@ async def run_relay(args):
     with open(args.request_file, "r") as f:
         request_text = f.read()
 
-    # Extract REPO and REVIEW_REQUEST_ID for routing and anti-crosstalk
-    repo = None
-    req_id = None
-    session = None
-    for line in request_text.split('\n'):
-        if line.startswith("REPO:"):
-            repo = line.split("REPO:")[1].strip()
-        elif line.startswith("REVIEW_REQUEST_ID:"):
-            req_id = line.split("REVIEW_REQUEST_ID:")[1].strip()
-        elif line.startswith("SESSION:"):
-            session = line.split("SESSION:", 1)[1].strip()
-
-    if not repo:
-        print("Error: REPO field not found in request file. Fail closed.")
+    envelope, _body = parse_transport_envelope(request_text)
+    if envelope is None:
+        print("Error: malformed or incomplete transport envelope in request file. Fail closed.")
         return 1
-    if not req_id:
-        print("Error: REVIEW_REQUEST_ID field not found in request file. Fail closed.")
-        return 1
+    repo = envelope["REPO"]
+    req_id = envelope["REVIEW_REQUEST_ID"]
+    checkpoint = envelope["CHECKPOINT"]
+    session = envelope["SESSION"]
 
     # 2. Config Routing (Trusted routing only)
     config_file = args.config_file

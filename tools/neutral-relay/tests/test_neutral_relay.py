@@ -10,6 +10,49 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import neutral_relay
 
 
+class TestTransportEnvelope(unittest.TestCase):
+    def envelope(self, body="payload"):
+        return ("REVIEW_REQUEST_ID: OUTER\nREPO: owner/outer\n"
+                "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-OUTER\n\n" + body)
+
+    def test_body_metadata_cannot_overwrite_authoritative_header(self):
+        fields, body = neutral_relay.parse_transport_envelope(self.envelope(
+            "REVIEW_REQUEST_ID: INNER\nREPO: owner/inner\nSESSION: S-INNER"))
+        self.assertEqual(fields, {
+            "REVIEW_REQUEST_ID": "OUTER", "REPO": "owner/outer",
+            "CHECKPOINT": "REVIEW_REQUIRED", "SESSION": "S-OUTER",
+        })
+        self.assertEqual(body, "REVIEW_REQUEST_ID: INNER\nREPO: owner/inner\nSESSION: S-INNER")
+
+    def test_duplicate_or_conflicting_header_fields_fail_closed(self):
+        duplicate = self.envelope().replace(
+            "REPO: owner/outer\n", "REPO: owner/outer\nREVIEW_REQUEST_ID: OTHER\n")
+        self.assertEqual(neutral_relay.parse_transport_envelope(duplicate), (None, None))
+        conflicting = self.envelope().replace("SESSION: S-OUTER", "SESSION: S-ONE\nSESSION: S-TWO")
+        self.assertEqual(neutral_relay.parse_transport_envelope(conflicting), (None, None))
+
+    def test_missing_checkpoint_fails_closed(self):
+        missing = self.envelope().replace("CHECKPOINT: REVIEW_REQUIRED\n", "")
+        self.assertEqual(neutral_relay.parse_transport_envelope(missing), (None, None))
+
+    def test_build_request_header_round_trips_exactly(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+                            "skills", "workbuddy", "governloop", "scripts", "governloop_session.py")
+        spec = importlib.util.spec_from_file_location("governloop_session_for_envelope", path)
+        session = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(session)
+        state = {"session_id": "S-1", "repo": "owner/repo"}
+        generated = session.build_request(state, "REVIEW_REQUIRED", "body", 7)
+        fields, body = neutral_relay.parse_transport_envelope(generated)
+        self.assertEqual(fields, {
+            "REVIEW_REQUEST_ID": "S-1-REVIEW_REQUIRED-7",
+            "REPO": "owner/repo", "CHECKPOINT": "REVIEW_REQUIRED", "SESSION": "S-1",
+        })
+        self.assertEqual(body, "body\n\nReturn the complete response and finish with this exact line:\n"
+                         "END_REVIEW_RESPONSE: S-1-REVIEW_REQUIRED-7")
+
+
 class TestResponseCompletionTracker(unittest.TestCase):
     def snapshot(self, text, *, user_count=2, last_user_text="RID-1", soft=False, has_assistant=True,
                  has_copy_rate=True, stop_present=False, user_id=None, assistant_id=None,
@@ -259,7 +302,8 @@ class TestNeutralRelay(unittest.TestCase):
     def test_repo_route_parsing_and_dry_run(self):
         # Setup valid request
         with open(self.req_path, "w") as f:
-            f.write("REVIEW_REQUEST_ID: 12345\nREPO: test/repo\nPR: 1\nHEAD: abc\n")
+            f.write("REVIEW_REQUEST_ID: 12345\nREPO: test/repo\n"
+                    "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-1\n\nPR: 1\nHEAD: abc\n")
 
         # An explicit --config-file equivalent must continue to override the default.
         args = self.Args(self.req_path, self.out_path, self.config_path, dry_run=True)
@@ -273,7 +317,8 @@ class TestNeutralRelay(unittest.TestCase):
 
     def test_unknown_repo_fails_closed(self):
         with open(self.req_path, "w") as f:
-            f.write("REVIEW_REQUEST_ID: 12345\nREPO: unknown/repo\nPR: 1\nHEAD: abc\n")
+            f.write("REVIEW_REQUEST_ID: 12345\nREPO: unknown/repo\n"
+                    "CHECKPOINT: REVIEW_REQUIRED\nSESSION: S-1\n\nPR: 1\nHEAD: abc\n")
 
         args = self.Args(self.req_path, self.out_path, self.config_path, dry_run=True)
         ret = asyncio.run(neutral_relay.run_relay(args))
