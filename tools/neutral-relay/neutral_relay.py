@@ -53,6 +53,22 @@ def _looks_truncated(text):
         return False
     return s.count("{") > s.count("}")
 
+
+def validate_response_contract(text, req_id, session=None, repo=None):
+    """Validate the generic, request-bound relay response envelope."""
+    if not isinstance(text, str) or not text.strip() or not req_id:
+        return False, "RESPONSE_CONTRACT_INCOMPLETE"
+    lines = {line.strip() for line in text.splitlines()}
+    if f"REVIEW_REQUEST_ID: {req_id}" not in lines and f"REVIEW_REQUEST_ID={req_id}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    if session and f"SESSION: {session}" not in lines and f"SESSION={session}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    if repo and f"REPO: {repo}" not in lines and f"REPO={repo}" not in lines:
+        return False, "RESPONSE_CONTRACT_CORRELATION_INVALID"
+    if f"END_REVIEW_RESPONSE: {req_id}" not in lines and f"END_REVIEW_RESPONSE={req_id}" not in lines:
+        return False, "RESPONSE_CONTRACT_INCOMPLETE"
+    return True, "RESPONSE_VALID"
+
 # Strong delivery confirmation (see run_relay): "send button clicked" is NOT
 # "message delivered". A click that lands while ChatGPT is still processing
 # freshly-uploaded attachments can be silently swallowed, leaving the draft in
@@ -870,11 +886,14 @@ async def run_relay(args):
     # Extract REPO and REVIEW_REQUEST_ID for routing and anti-crosstalk
     repo = None
     req_id = None
+    session = None
     for line in request_text.split('\n'):
         if line.startswith("REPO:"):
             repo = line.split("REPO:")[1].strip()
         elif line.startswith("REVIEW_REQUEST_ID:"):
             req_id = line.split("REVIEW_REQUEST_ID:")[1].strip()
+        elif line.startswith("SESSION:"):
+            session = line.split("SESSION:", 1)[1].strip()
 
     if not repo:
         print("Error: REPO field not found in request file. Fail closed.")
@@ -919,10 +938,12 @@ async def run_relay(args):
             f"REVIEW_REQUEST_ID: {req_id}\n"
             "VERDICT: PASS\n"
             f"REPO: {repo}\n"
+            f"SESSION: {session or ''}\n"
             "PR: mock\n"
             "HEAD: mock\n"
             "SUMMARY: Dry run test\n"
             "ACTIONS: None\n"
+            f"END_REVIEW_RESPONSE: {req_id}\n"
         )
         with open(args.output_file, "w") as f:
             f.write(mock_response)
@@ -1158,7 +1179,7 @@ async def run_relay(args):
                 // B4 (F1): ChatGPT renders the action bar (copy / rate icons)
                 // only after the message is finalized. Multi-selector fallback
                 // in case ChatGPT renames these controls.
-                const copyRate = document.querySelector(
+                const copyRate = assistant && assistant.querySelector(
                     'button[aria-label*="Copy"], button[aria-label*="复制"], ' +
                     '[data-testid*="copy"], [data-testid*="like"], [data-testid*="thumbs"], ' +
                     'button[aria-label*="评价"], button[aria-label*="点赞"], button[aria-label*="点踩"], ' +
@@ -1296,6 +1317,11 @@ async def run_relay(args):
         if not found_response:
             print(f"Error: Timed out after {args.wait_timeout}s waiting for a new stable Assistant response to settle.")
             await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
+            return 1
+
+        valid, contract_status = validate_response_contract(final_text, req_id, session, repo)
+        if not valid:
+            print(f"RESPONSE_CONTRACT_{contract_status}: refusing canonical response write")
             return 1
 
         with open(args.output_file, "w") as f:

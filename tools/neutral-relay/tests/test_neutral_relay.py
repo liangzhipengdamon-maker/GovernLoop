@@ -161,6 +161,15 @@ class TestResponseCompletionTracker(unittest.TestCase):
         for now in (0, 2, 4, 6, 8, 16):
             self.assertEqual(tracker.observe(snap, 1, "RID-1", now=now), (False, ""))
 
+    def test_response_contract_requires_correlations_and_end_marker(self):
+        rid = "RID-1"
+        text = (f"REVIEW_REQUEST_ID: {rid}\nSESSION: S-1\nREPO: owner/repo\n"
+                f"END_REVIEW_RESPONSE: {rid}")
+        self.assertEqual(neutral_relay.validate_response_contract(text, rid, "S-1", "owner/repo"),
+                         (True, "RESPONSE_VALID"))
+        self.assertFalse(neutral_relay.validate_response_contract("PR_MERGE_AUTHORIZED\nRE", rid, "S-1", "owner/repo")[0])
+        self.assertFalse(neutral_relay.validate_response_contract(text.replace("REPO: owner/repo", "REPO: other/repo"), rid, "S-1", "owner/repo")[0])
+
 
 class TestNeutralRelay(unittest.TestCase):
     def setUp(self):
