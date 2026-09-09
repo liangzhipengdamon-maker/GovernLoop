@@ -283,6 +283,65 @@ class TestSendConfirmationReconciliation(TestSendConfirmation):
         self.assertIn("DELIVERY_CONFIRMED_RECONCILED: PASS", buf.getvalue())
         self.assertEqual(fake.clicks, 1)  # no re-click after composer cleared
 
+    def test_exact_request_identity_confirms_when_aggregate_count_is_unchanged(self):
+        req_id = "REQ-IDENTITY-1"
+        snap = {
+            "userCount": 2,
+            "lastUserText": "a later unrelated user message",
+            "requestUserMatches": 1,
+            "requestUserId": "message-request-1",
+            "requestAssistantId": None,
+            "text": "",
+            "hasAssistant": False,
+            "softGenerating": False,
+            "hasCopyRate": False,
+            "stopPresent": False,
+        }
+        fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snap, req_id, pending_timeout=3)
+        result = asyncio.run(conf.confirm(2))
+        delivered, primary, status = result
+        self.assertTrue(delivered)
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertEqual(fake.clicks, 1)
+
+    def test_later_user_does_not_break_original_request_identity(self):
+        req_id = "REQ-IDENTITY-2"
+        snap = {
+            "userCount": 2,
+            "lastUserText": "later user turn",
+            "requestUserMatches": 1,
+            "requestUserId": "message-request-2",
+            "requestAssistantId": "message-assistant-2",
+            "text": "",
+            "hasAssistant": False,
+        }
+        fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+        conf = self._conf(fake, snap, req_id, pending_timeout=3)
+        delivered, primary, status = asyncio.run(conf.confirm(2))
+        self.assertTrue(delivered)
+        self.assertFalse(primary)
+        self.assertEqual(status, "DELIVERY_CONFIRMED_RECONCILED")
+        self.assertEqual(fake.clicks, 1)
+
+    def test_missing_or_ambiguous_request_identity_stays_pending(self):
+        for matches, message_id in ((0, None), (2, "message-request-1")):
+            snap = {
+                "userCount": 2,
+                "lastUserText": "unrelated user turn",
+                "requestUserMatches": matches,
+                "requestUserId": message_id,
+                "text": "",
+                "hasAssistant": False,
+            }
+            fake = FakeSequenced(cleared=[True], users=[2] * 10, assistants=[3] * 10)
+            conf = self._conf(fake, snap, "REQ-IDENTITY-3", pending_timeout=2)
+            delivered, _primary, status = asyncio.run(conf.confirm(2))
+            self.assertFalse(delivered)
+            self.assertEqual(status, "SEND_PENDING_TIMEOUT")
+            self.assertEqual(fake.clicks, 1)
+
     def test_pending_unrelated_assistant_message_does_not_reconcile(self):
         # safety boundary: an assistant reply WITHOUT our REVIEW_REQUEST_ID in
         # the thread's last user message must NOT count as delivery proof ->

@@ -127,6 +127,10 @@ class ResponseCompletionTracker:
         text = str(snapshot.get("text") or "").strip()
         has_assistant = bool(snapshot.get("hasAssistant"))
         soft_generating = bool(snapshot.get("softGenerating"))
+        try:
+            request_user_matches = int(snapshot.get("requestUserMatches") or 0)
+        except (TypeError, ValueError):
+            request_user_matches = 0
 
         # B4 hard completion gate (F1): ChatGPT renders the action bar (copy /
         # rate icons) only after it finalizes an assistant message, and removes
@@ -142,9 +146,15 @@ class ResponseCompletionTracker:
         # Correlation: this send must have produced a new user turn followed by
         # an assistant turn. The response itself is NOT required to echo
         # REVIEW_REQUEST_ID (supports generic transport).
-        user_added = (user_count > user_count_before) or (
-            bool(req_id) and req_id in last_user_text
-        )
+        if req_id and "requestUserMatches" in snapshot:
+            # Once the request-aware snapshot is available, do not fall back
+            # to lastUserText: duplicate matches must remain ambiguous even
+            # when one of them happens to be the last user node.
+            user_added = (user_count > user_count_before) or request_user_matches == 1
+        else:
+            user_added = (user_count > user_count_before) or (
+                bool(req_id) and req_id in last_user_text
+            )
 
         if not (user_added and has_assistant and text):
             self.reset()
@@ -291,16 +301,24 @@ class SendConfirmation:
             return False, False, "SEND_BUTTON_UNAVAILABLE"
         await self.sleep(self.ui_transition_seconds)
 
-        delivered, primary, cleared, user_now, assistant_now = await self._await_confirm(
+        delivered, primary, cleared, user_now, assistant_now, evidence = await self._await_confirm(
             user_count_before)
+        if delivered and evidence == "REQUEST_CORRELATED":
+            print("DELIVERY_CONFIRMED_RECONCILED: PASS (exact request-correlated user "
+                  "message identity observed)")
+            return True, False, "DELIVERY_CONFIRMED_RECONCILED"
         if not delivered and not cleared:
             # Draft still present: one safe re-click is allowed.
             print("SEND_DRAFT_STILL_PRESENT: composer not cleared after first send attempt. "
                   "Re-clicking send once (no re-upload, no re-inject).")
             if await self.click_send():
                 await self.sleep(self.ui_transition_seconds)
-                delivered, primary, cleared, user_now, assistant_now = await self._await_confirm(
+                delivered, primary, cleared, user_now, assistant_now, evidence = await self._await_confirm(
                     user_count_before)
+                if delivered and evidence == "REQUEST_CORRELATED":
+                    print("DELIVERY_CONFIRMED_RECONCILED: PASS (exact request-correlated "
+                          "user message identity observed)")
+                    return True, False, "DELIVERY_CONFIRMED_RECONCILED"
         if not delivered and not cleared:
             print("SEND_NOT_CONFIRMED: composer still non-empty after "
                   f"{SEND_CONFIRM_MAX_ATTEMPTS} attempts "
@@ -379,11 +397,29 @@ class SendConfirmation:
             user_now, assistant_now = await self.turn_counts()
             cleared = await self.composer_cleared()
             if cleared and user_now == user_count_before + 1:
-                return True, True, True, user_now, assistant_now
+                return True, True, True, user_now, assistant_now, "USER_COUNT"
             if cleared:
-                return False, False, True, user_now, assistant_now   # -> SEND_PENDING
+                if await self._request_correlated_user_observed():
+                    return True, False, True, user_now, assistant_now, "REQUEST_CORRELATED"
+                return False, False, True, user_now, assistant_now, None   # -> SEND_PENDING
             await self.sleep(1)
-        return False, False, False, user_now, assistant_now
+        return False, False, False, user_now, assistant_now, None
+
+    async def _request_correlated_user_observed(self):
+        """Return true only for one identity-bearing user node containing req_id.
+
+        Aggregate DOM counts are diagnostic only. A unique request-correlated
+        user message with a stable DOM identity is sufficient delivery evidence
+        once the composer has cleared; ambiguity remains SEND_PENDING.
+        """
+        if self.snapshot is None or not self.req_id:
+            return False
+        snapshot = await self.snapshot()
+        try:
+            matches = int(snapshot.get("requestUserMatches") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return matches == 1 and bool(snapshot.get("requestUserId"))
 
 
 # ── Chat composer targeting (two-phase safety model) ─────────────────────────
@@ -1082,11 +1118,15 @@ async def run_relay(args):
             return await js("""(()=>{
                 const roles = Array.from(document.querySelectorAll('[data-message-author-role]'));
                 const users = roles.filter(n => n.getAttribute('data-message-author-role') === 'user');
+                const requestId = %s;
+                const requestMatches = requestId ? users.filter(n =>
+                    (n.innerText || n.textContent || '').includes(requestId)) : [];
+                const requestUser = requestMatches.length === 1 ? requestMatches[0] : null;
                 const lastUser = users.length ? users[users.length - 1] : null;
                 const lastUserText = lastUser ? ((lastUser.innerText || lastUser.textContent || '').trim()) : '';
                 let assistant = null;
-                if (lastUser) {
-                    const idx = roles.indexOf(lastUser);
+                if (requestUser) {
+                    const idx = roles.indexOf(requestUser);
                     for (let i = idx + 1; i < roles.length; i++) {
                         if (roles[i].getAttribute('data-message-author-role') === 'assistant') {
                             assistant = roles[i];
@@ -1114,6 +1154,9 @@ async def run_relay(args):
                 return {
                     userCount:users.length,
                     lastUserText:lastUserText,
+                    requestUserMatches:requestMatches.length,
+                    requestUserId:requestUser ? requestUser.getAttribute('data-message-id') : null,
+                    requestAssistantId:assistant ? assistant.getAttribute('data-message-id') : null,
                     text:text,
                     hasAssistant:!!assistant,
                     softGenerating:(!!stop || streaming),
@@ -1122,7 +1165,7 @@ async def run_relay(args):
                     hasCopyRate:!!copyRate,
                     visibilityState:document.visibilityState
                 };
-            })()""")
+            })()""" % _js_str(req_id))
 
         confirmation = SendConfirmation(
             click_send=_click_send,
