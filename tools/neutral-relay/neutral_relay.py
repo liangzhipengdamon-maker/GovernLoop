@@ -47,6 +47,7 @@ STATE_CREATED = "CREATED"
 STATE_SENT = "SENT"
 STATE_USER_CONFIRMED = "USER_CONFIRMED"
 STATE_ASSISTANT_CONFIRMED = "ASSISTANT_CONFIRMED"
+STATE_COMPLETION_UI_CONFIRMED = "COMPLETION_UI_CONFIRMED"
 STATE_POST_COMPLETION_RECONCILIATION = "POST_COMPLETION_RECONCILIATION"
 STATE_RESPONSE_VALIDATED = "RESPONSE_VALIDATED"
 STATE_CANONICAL_WRITTEN = "CANONICAL_WRITTEN"
@@ -137,6 +138,16 @@ def validate_response_contract(text, req_id, session=None, repo=None):
     if not non_empty_lines or non_empty_lines[-1] not in end_markers:
         return False, "RESPONSE_CONTRACT_INCOMPLETE"
     return True, "RESPONSE_VALID"
+
+
+def write_canonical_response(output_file, text, req_id, session=None, repo=None):
+    """Validate and write one exact response without an additional settle wait."""
+    valid, status = validate_response_contract(text, req_id, session, repo)
+    if not valid:
+        return False, status
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True, status
 
 # Strong delivery confirmation (see run_relay): "send button clicked" is NOT
 # "message delivered". A click that lands while ChatGPT is still processing
@@ -1410,44 +1421,22 @@ async def run_relay(args):
                 req_id=req_id,
             )
             if complete:
-                # B4 (F3): post-finalize confirmation — the same node must stay
-                # text-identical across CONFIRM_READS more reads before we write
-                # the response. A resumed stream cancels the finalize (revocable).
-                confirmed = True
-                confirm_text = settled_text
-                for _ in range(CONFIRM_READS):
-                    await asyncio.sleep(CONFIRM_INTERVAL_SECONDS)
-                    snap2 = await _response_snapshot(user_message_id, assistant_message_id)
-                    c2, t2 = completion.observe(snap2, user_count_before, req_id)
-                    if not c2:
-                        confirmed = False
-                        break
-                    confirm_text = t2
-                if confirmed:
-                    final_text = confirm_text
-                    phase = STATE_POST_COMPLETION_RECONCILIATION
-                    # B4 auto-fallback (F6, system-initiated — no user consent,
-                    # no waiting for a request): if the reply still looks
-                    # truncated (e.g. an envelope JSON cut mid-string), the relay
-                    # proactively captures a token-free screenshot AND performs a
-                    # short recovery re-read of the same node. This is the
-                    # proactive remediation for GPT conversation truncation.
-                    if _looks_truncated(final_text):
-                        await _capture_screenshot(f"{req_id}-truncated")
-                        diag_recovery = "truncated-evidence"
-                        recovery_deadline = time.time() + RECOVERY_SECONDS
-                        while time.time() < recovery_deadline:
-                            await asyncio.sleep(2)
-                            t2 = str((await _response_snapshot(user_message_id, assistant_message_id)).get("text") or "").strip()
-                            if t2 and not _looks_truncated(t2):
-                                final_text = t2
-                                diag_recovery = "recovered"
-                                break
-                    else:
-                        diag_recovery = "none"
-                    found_response = True
-                    break
-                # else: text resumed -> keep waiting on the outer loop
+                # Exact scoped completion UI is the terminal signal. Write the
+                # exact stable text immediately; partial/correlated-invalid
+                # text is rejected by the unchanged contract gate below.
+                final_text = settled_text
+                phase = STATE_COMPLETION_UI_CONFIRMED
+                diag_recovery = "none"
+                valid, contract_status = write_canonical_response(
+                    args.output_file, final_text, req_id, session, repo)
+                if not valid:
+                    print(f"RESPONSE_CONTRACT_{contract_status}: refusing canonical response write")
+                    return 1
+                state = STATE_RESPONSE_VALIDATED
+                state = STATE_CANONICAL_WRITTEN
+                state = STATE_DONE
+                found_response = True
+                break
 
             await asyncio.sleep(2)
 
@@ -1481,17 +1470,6 @@ async def run_relay(args):
             await _capture_screenshot(f"{req_id}-timeout")  # B4 auto fallback (anomaly path)
             return 1
 
-        valid, contract_status = validate_response_contract(final_text, req_id, session, repo)
-        if not valid:
-            print(f"RESPONSE_CONTRACT_{contract_status}: refusing canonical response write")
-            return 1
-        state = STATE_RESPONSE_VALIDATED
-
-        with open(args.output_file, "w") as f:
-            f.write(final_text)
-
-        state = STATE_CANONICAL_WRITTEN
-        state = STATE_DONE
         print(f"Success: Wrote response to {args.output_file}")
         return 0
 

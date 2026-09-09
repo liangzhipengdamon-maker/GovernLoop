@@ -278,6 +278,17 @@ class TestResponseCompletionTracker(unittest.TestCase):
     def test_hard_reconciliation_deadline_fails_closed(self):
         self.assertIsNone(neutral_relay.response_wait_phase(200, 100, 200))
 
+    def test_completion_ui_candidate_writes_canonical_response_immediately(self):
+        rid = "RID-T100"
+        text = f"REVIEW_REQUEST_ID: {rid}\nEND_REVIEW_RESPONSE: {rid}"
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "response.md")
+            ok, status = neutral_relay.write_canonical_response(path, text, rid)
+            self.assertTrue(ok)
+            self.assertEqual(status, "RESPONSE_VALID")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+
 
 class TestNeutralRelay(unittest.TestCase):
     def setUp(self):
